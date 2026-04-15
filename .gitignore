@@ -1,0 +1,58 @@
+# ==================================
+# IGNORING DATASETS (HUGE FILES)
+# ==================================
+Data_new/
+Data_new2/
+Datav2/
+Datav2_Balanced/
+Datav2_Single/
+data/
+
+# ==================================
+# IGNORING VIDEOS & LARGE MEDIA
+# ==================================
+*.mp4
+*.avi
+*.mkv
+*.jpg
+*.png
+!outputs/violations/*.jpg # If you want to keep violation sample images, uncomment this. Otherwise keep ignored.
+
+# ==================================
+# IGNORING WEIGHTS & MODELS
+# ==================================
+*.pt
+*.onnx
+models/
+# NGOAI LE: Cho phep up cac model tot nhat trong bo suu tap
+!models/best_collection/
+!models/best_collection/*.pt
+
+# Khuyen nghi: Khong up toan bo final_runs len Github vi rat nang.
+# Chi up cac file trong models/best_collection da duoc loc.
+
+# ==================================
+# IGNORING YOLO RUNS LOGS
+# ==================================
+runs/
+runs_fisheye/
+final_runs/
+# Luu y: Thu muc nay chua cache va bieu do huan luyen rat nang.
+
+# ==================================
+# PYTHON CACHE & VENV
+# ==================================
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+.venv/
+
+# ==================================
+# OUTPUTS (Keep CSVs only)
+# ==================================
+outputs/runs/
+outputs/logs/
+outputs/results/*.mp4
+outputs/violations/
