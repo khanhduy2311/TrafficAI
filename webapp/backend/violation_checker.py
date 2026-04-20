@@ -92,6 +92,9 @@ class RedLightChecker:
         self.last_seen_frame: dict = {}
         self.grace_period_frames = 50  # ~2.0 * fps (assume 25fps)
 
+        # Chỉ vẽ zones khi đã detect được đèn giao thông
+        self.traffic_light_ever_detected: bool = False
+
         # ROI polygons — sẽ được set từ pipeline
         self.roi1_polygon: Optional[np.ndarray] = None
         self.roi2_polygon: Optional[np.ndarray] = None
@@ -174,7 +177,11 @@ class RedLightChecker:
 
         self.prev_raw_status = raw_status
         self.light_history.append(raw_status)
-        
+
+        # Đánh dấu đã detect được đèn ít nhất 1 lần
+        if raw_status != "unknown":
+            self.traffic_light_ever_detected = True
+
         # Voting: trạng thái xuất hiện nhiều nhất
         if self.light_history:
             self.current_light_status = max(set(self.light_history), key=list(self.light_history).count)
@@ -317,8 +324,11 @@ class RedLightChecker:
         return filename
 
     def draw_zones(self, frame: np.ndarray):
-        """Vẽ Zone 1, Zone 2 lên frame."""
+        """Vẽ Zone 1, Zone 2 lên frame — chỉ khi đã detect được đèn giao thông."""
         if self.roi1_polygon is None:
+            return
+        # Chỉ hiển thị zone khi đèn giao thông đã được phát hiện
+        if not self.traffic_light_ever_detected:
             return
         is_red = self.current_light_status == "red"
         zone2_color = (0, 0, 255) if is_red else (0, 200, 0)
@@ -338,6 +348,7 @@ class RedLightChecker:
         self.last_seen_frame.clear()
         self.prev_raw_status = "unknown"
         self.current_light_status = "unknown"
+        self.traffic_light_ever_detected = False
         self.roi1_polygon = None
         self.roi2_polygon = None
 
