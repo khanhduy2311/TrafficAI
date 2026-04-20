@@ -254,11 +254,13 @@ class DetectionPipeline:
             )
             all_violations.extend(lane_violations)
 
-        # --- Speed check (placeholder) ---
+        # --- Speed check ---
         if results.get("speed") is not None and speed_model and len(v_boxes) > 0:
             speed_violations = self.speed_limit_checker.check(
                 results["speed"], v_boxes, v_ids, v_classes, v_confs,
-                vehicle_model, self.frame_count, original_frame
+                vehicle_model, self.frame_count, original_frame,
+                source_fps=self.source_fps,
+                speed_sign_model=speed_model,
             )
             all_violations.extend(speed_violations)
 
@@ -320,19 +322,23 @@ class DetectionPipeline:
     ):
         """Vẽ bounding boxes, zones, labels, stats lên frame."""
 
-        # 1. Vẽ zones (red light & wrong lane)
+        # 1. Vẽ zones (red light & wrong lane & speed safe-zone)
         self.red_light_checker.draw_zones(frame)
         self.wrong_lane_checker.draw_zones(frame)
+        self.speed_limit_checker.draw_safe_zone(frame)
 
         # 2. Vẽ vehicle boxes
-        violated_ids = self.red_light_checker.violators
+        violated_ids      = self.red_light_checker.violators
         lane_violated_ids = self.wrong_lane_checker.violated_ids
+        speed_violated_ids = self.speed_limit_checker.violated_ids
+        speed_map          = self.speed_limit_checker.speed_map
+
         for box, tid, cls_id, conf in zip(v_boxes, v_ids, v_classes, v_confs):
             x1, y1, x2, y2 = map(int, box)
             tid = int(tid)
             cls_name = vehicle_model.names[int(cls_id)]
 
-            if tid in violated_ids or tid in lane_violated_ids:
+            if tid in violated_ids or tid in lane_violated_ids or tid in speed_violated_ids:
                 color = (0, 0, 255)
                 extra = " [VI PHAM]"
             elif tid in self.red_light_checker.vehicles_in_zone1:
@@ -348,7 +354,11 @@ class DetectionPipeline:
                 if tid in self.wrong_lane_checker.direction_map:
                     lane_info += f" -> {self.wrong_lane_checker.direction_map[tid]}"
 
-            label = f"{cls_name} ID:{tid}{lane_info}{extra}"
+            speed_info = ""
+            if tid in speed_map:
+                speed_info = f" {speed_map[tid]}km/h"
+
+            label = f"{cls_name} ID:{tid}{lane_info}{speed_info}{extra}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, max(0, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2, cv2.LINE_AA)
@@ -408,8 +418,21 @@ class DetectionPipeline:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, disp_color, 2, cv2.LINE_AA)
         cv2.putText(frame, f"Vehicles: {vehicle_count}", (15, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"Violations: {len(self.red_light_checker.violators) + len(self.no_helmet_checker.violated_ids)}",
-                    (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 1, cv2.LINE_AA)
+
+        # Speed limit badge
+        limit_val = self.speed_limit_checker.current_speed_limit
+        if limit_val > 0:
+            cv2.putText(frame, f"Limit: {limit_val} km/h", (15, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1, cv2.LINE_AA)
+
+        total_vio = (
+            len(self.red_light_checker.violators)
+            + len(self.no_helmet_checker.violated_ids)
+            + len(self.wrong_lane_checker.violated_ids)
+            + len(self.speed_limit_checker.violated_ids)
+        )
+        cv2.putText(frame, f"Violations: {total_vio}",
+                    (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 1, cv2.LINE_AA)
         cv2.putText(frame, f"Frame: {self.frame_count}",
                     (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (150, 150, 150), 1, cv2.LINE_AA)

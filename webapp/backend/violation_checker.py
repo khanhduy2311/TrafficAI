@@ -530,29 +530,166 @@ class WrongLaneChecker:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  4. SPEED LIMIT VIOLATION CHECKER
-#     (Placeholder — chèn logic detect_speed_limit.py sau)
+#  4. SPEED ENGINE  (Fisheye-aware pixel → real-world distance)
+#     Ported from detect_speed_limit.py → class SpeedEngine
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import math as _math
+
+class SpeedEngine:
+    """
+    Chuyển đổi tọa độ pixel (fisheye) → tọa độ thực tế (mét),
+    rồi tính tốc độ (km/h) có median-smoothing để giảm nhiễu.
+
+    Tham số:
+      w, h          : kích thước frame (pixel)
+      fov_deg       : góc nhìn ngang của lens fisheye (độ, VD: 185)
+      real_radius_m : bán kính thực tế tương ứng với rìa safe-zone (mét)
+      safe_ratio    : tỉ lệ bán kính safe-zone / R_pixel (0-1)
+    """
+
+    def __init__(
+        self,
+        w: int, h: int,
+        fov_deg: float = 185.0,
+        real_radius_m: float = 25.0,
+        safe_ratio: float = 0.8,
+    ):
+        self.cx, self.cy = w / 2.0, h / 2.0
+        self.R_px = min(self.cx, self.cy)
+        self.safe_limit_px = self.R_px * safe_ratio
+
+        # Equidistant fisheye model: r = f * theta
+        fov_rad = _math.radians(fov_deg) / 2.0
+        self.f_px = self.R_px / fov_rad
+        self.meters_per_radian = real_radius_m / fov_rad
+
+        # track_id → {'pos': deque, 'times': deque, 'speeds': deque}
+        self.track_history: dict = {}
+
+    def pixel_to_real(self, px: float, py: float):
+        """Trả về (X_m, Y_m) tọa độ thực tế."""
+        dx, dy = px - self.cx, py - self.cy
+        r_px = _math.sqrt(dx ** 2 + dy ** 2)
+        if r_px < 1e-6:
+            return 0.0, 0.0
+        theta = r_px / self.f_px
+        real_r = self.meters_per_radian * theta
+        phi = _math.atan2(dy, dx)
+        return real_r * _math.cos(phi), real_r * _math.sin(phi)
+
+    def update_and_get_speed(self, track_id: int, pt, timestamp: float) -> int:
+        """
+        Cập nhật lịch sử vị trí của xe và trả về tốc độ trung vị (km/h).
+        Trả -1 nếu xe nằm ngoài safe-zone.
+        """
+        dx, dy = pt[0] - self.cx, pt[1] - self.cy
+        if _math.sqrt(dx ** 2 + dy ** 2) > self.safe_limit_px:
+            return -1  # Ngoài vùng đo
+
+        if track_id not in self.track_history:
+            self.track_history[track_id] = {
+                'pos':    deque(maxlen=5),
+                'times':  deque(maxlen=5),
+                'speeds': deque(maxlen=7),
+            }
+
+        hist = self.track_history[track_id]
+        real_pos = self.pixel_to_real(pt[0], pt[1])
+
+        speed_kmh = 0
+        if len(hist['pos']) > 0:
+            dt = timestamp - hist['times'][-1]
+            if 0 < dt < 1.0:
+                prev = hist['pos'][-1]
+                dist = _math.sqrt((real_pos[0] - prev[0]) ** 2 + (real_pos[1] - prev[1]) ** 2)
+                # Teleport-check: loại nhiễu khi tracker nhảy đột ngột (>144 km/h)
+                if dist / dt < 40.0:
+                    hist['speeds'].append((dist / dt) * 3.6)
+                    speed_kmh = int(np.median(list(hist['speeds'])))
+
+        hist['pos'].append(real_pos)
+        hist['times'].append(timestamp)
+        return speed_kmh
+
+    def reset(self):
+        self.track_history.clear()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  5. SPEED LIMIT VIOLATION CHECKER
+#     Dùng SpeedEngine + model detect biển báo tốc độ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SpeedLimitChecker:
     """
     Phát hiện xe vượt quá tốc độ cho phép.
 
-    TODO: Tích hợp logic từ detect_speed_limit.py
-    - Model detect biển giới hạn tốc độ: detect_speed_sign.pt
-    - Kết hợp với tracking để tính tốc độ xe (pixel/frame → km/h)
-    - So sánh với giới hạn từ biển báo
+    - Auto-detect giới hạn tốc độ từ kết quả model biển báo.
+    - Tính tốc độ xe bằng SpeedEngine (fisheye-aware).
+    - Cooldown 5 giây / xe để tránh lưu bằng chứng trùng lặp.
 
-    Hiện tại: placeholder, trả về list rỗng.
+    Cấu hình:
+      default_limit_kmh : giới hạn mặc định nếu chưa detect được biển (km/h)
+      threshold         : ngưỡng vi phạm (VD: 1.05 = quá 5%)
+      fov_deg           : góc nhìn fisheye (độ)
+      real_radius_m     : bán kính thực tế tại rìa safe-zone (mét)
+      safe_ratio        : tỉ lệ safe-zone
     """
 
-    def __init__(self):
-        self.violated_ids: set = set()
-        self.current_speed_limit: int = 0   # km/h, 0 = chưa detect
+    def __init__(
+        self,
+        default_limit_kmh: int = 50,
+        threshold: float = 1.05,
+        fov_deg: float = 185.0,
+        real_radius_m: float = 25.0,
+        safe_ratio: float = 0.8,
+    ):
+        self.default_limit = default_limit_kmh
+        self.threshold = threshold
+        self.fov_deg = fov_deg
+        self.real_radius_m = real_radius_m
+        self.safe_ratio = safe_ratio
 
+        self.current_speed_limit: int = default_limit_kmh
+        self.violated_ids: set = set()
+        self.cooldown_dict: dict = {}     # track_id → last_violation_time (giây)
+        self.speed_map: dict = {}         # track_id → speed (km/h) để annotate
+        self._engine: Optional[SpeedEngine] = None
+
+    # ────────────────────────────────────────────
+    # Khởi tạo engine khi biết kích thước frame
+    # ────────────────────────────────────────────
+    def init_engine(self, w: int, h: int):
+        self._engine = SpeedEngine(w, h, self.fov_deg, self.real_radius_m, self.safe_ratio)
+
+    # ────────────────────────────────────────────
+    # Lấy giới hạn tốc độ từ kết quả model biển báo
+    # ────────────────────────────────────────────
+    def _parse_speed_limit(self, sign_results, sign_model) -> Optional[int]:
+        """
+        Quét detections của speed-sign model.
+        Class name dạng "speed_50", "limit_30", "60"... → lấy số đầu tiên tìm được.
+        """
+        if sign_results is None or sign_model is None:
+            return None
+        found = []
+        for box in sign_results.boxes:
+            cls_name = sign_model.names[int(box.cls[0])]
+            nums = [int(s) for s in cls_name.replace("_", " ").split() if s.isdigit()]
+            if nums:
+                found.append(nums[0])
+        if found:
+            # Lấy giá trị xuất hiện nhiều nhất
+            return max(set(found), key=found.count)
+        return None
+
+    # ────────────────────────────────────────────
+    # Main check
+    # ────────────────────────────────────────────
     def check(
         self,
-        speed_sign_results,   # Kết quả từ model detect_speed_sign
+        speed_sign_results,
         vehicle_boxes,
         vehicle_track_ids,
         vehicle_classes,
@@ -560,22 +697,96 @@ class SpeedLimitChecker:
         vehicle_model,
         frame_number: int,
         original_frame: np.ndarray,
+        source_fps: int = 25,
+        speed_sign_model=None,      # model detect_speed_sign.pt
     ) -> list[ViolationEvent]:
-        """
-        TODO: Implement logic phát hiện vượt tốc độ
-        Gợi ý:
-        1. Detect biển báo tốc độ → lấy speed_limit
-        2. Tính tốc độ xe từ trajectory (pixels/frame → estimate km/h)
-        3. So sánh: nếu speed > speed_limit → vi phạm
-        """
         violations = []
-        # ── PLACEHOLDER: Chèn logic tại đây ──
-        # ...
+
+        if self._engine is None:
+            h, w = original_frame.shape[:2]
+            self.init_engine(w, h)
+
+        # Cập nhật giới hạn tốc độ từ biển báo
+        new_limit = self._parse_speed_limit(speed_sign_results, speed_sign_model)
+        if new_limit:
+            self.current_speed_limit = new_limit
+
+        limit = self.current_speed_limit
+        if limit <= 0:
+            return violations
+
+        curr_time = frame_number / max(source_fps, 1)
+
+        for box, track_id, cls_id, conf in zip(
+            vehicle_boxes, vehicle_track_ids, vehicle_classes, vehicle_confs
+        ):
+            x1, y1, x2, y2 = map(int, box)
+            track_id = int(track_id)
+            cls_name = vehicle_model.names[int(cls_id)].lower()
+
+            if cls_name == "pedestrian":
+                continue
+
+            # Điểm chân xe (bottom-center) làm anchor cho speed engine
+            anchor = ((x1 + x2) // 2, y2)
+            speed = self._engine.update_and_get_speed(track_id, anchor, curr_time)
+
+            # Lưu tốc độ để annotate lên frame
+            if speed >= 0:
+                self.speed_map[track_id] = speed
+
+            # Kiểm tra vi phạm
+            if speed > limit * self.threshold:
+                last_vio = self.cooldown_dict.get(track_id, -99)
+                if curr_time - last_vio > 5.0:
+                    self.cooldown_dict[track_id] = curr_time
+                    self.violated_ids.add(track_id)
+
+                    evidence_path = self._save_evidence(
+                        original_frame, x1, y1, x2, y2, track_id, frame_number, speed
+                    )
+
+                    violations.append(ViolationEvent(
+                        track_id=track_id,
+                        vehicle_type=vehicle_model.names[int(cls_id)],
+                        violation_type="speed_limit",
+                        confidence=float(conf),
+                        frame_number=frame_number,
+                        bbox=[x1, y1, x2, y2],
+                        evidence_path=evidence_path,
+                    ))
+
         return violations
+
+    def _save_evidence(self, frame, x1, y1, x2, y2, track_id, frame_number, speed) -> str:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        h, w = frame.shape[:2]
+        pad = 20
+        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+        cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+        crop = frame[cy1:cy2, cx1:cx2]
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"speed_id{track_id}_f{frame_number}_{speed}kmh_{ts}.jpg"
+        path = EVIDENCE_DIR / filename
+        cv2.imwrite(str(path), crop)
+        return filename
+
+    def draw_safe_zone(self, frame: np.ndarray):
+        """Vẽ vòng tròn safe-zone và HUD limit lên frame."""
+        if self._engine is None:
+            return
+        cx, cy = int(self._engine.cx), int(self._engine.cy)
+        r = int(self._engine.safe_limit_px)
+        cv2.circle(frame, (cx, cy), r, (200, 200, 200), 1, cv2.LINE_AA)
 
     def reset(self):
         self.violated_ids.clear()
-        self.current_speed_limit = 0
+        self.cooldown_dict.clear()
+        self.speed_map.clear()
+        self.current_speed_limit = self.default_limit
+        if self._engine:
+            self._engine.reset()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
