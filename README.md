@@ -7,6 +7,95 @@ Chào mừng đến với **TrafficAI**, hệ thống tự động phát hiện 
 4. **Lỗi vượt quá tốc độ** (Speed limits violation) 
 
 Toàn bộ quá trình theo dõi, nhận diện và bắt bằng chứng vi phạm được truyền tải (stream) trực tiếp theo thời gian thực lên giao diện web qua WebSocket!
+---
+
+## Kiến trúc hệ thống
+
+```mermaid
+graph TB
+    subgraph Frontend["🖥️ Frontend (HTML + CSS + JS)"]
+        UI[Dashboard UI]
+        WS_CLIENT[WebSocket Client]
+        VIDEO[Video Player Canvas]
+        VIOLATIONS_PANEL[Violations Panel]
+        STATS[Statistics Cards]
+    end
+
+    subgraph Backend["⚙️ Backend (FastAPI)"]
+        API[REST API Endpoints]
+        WS_SERVER[WebSocket Server]
+        PIPELINE[Detection Pipeline Manager]
+        
+        subgraph Models["🤖 AI Models (Parallel)"]
+            M1[Vehicle Tracker<br/>tracking.pt]
+            M2[Traffic Light<br/>detect_traffic_light.pt]
+            M3[Lane Violation<br/>detect_lane.pt]
+            M4[Helmet Detection<br/>detect_helmet.pt]
+            M5[Speed Sign<br/>detect_speed_sign.pt]
+        end
+        
+        subgraph ViolationCheckers["🚨 Violation Logic"]
+            V1[Red Light Runner]
+            V2[Wrong Lane]
+            V3[No Helmet]
+            V4[Speed Limit]
+        end
+    end
+
+    subgraph Storage["💾 Storage"]
+        DB[(SQLite DB)]
+        EVIDENCE[Evidence Images]
+        CSV_EXPORT[CSV Reports]
+    end
+
+    UI --> WS_CLIENT
+    WS_CLIENT <-->|WebSocket<br/>frames + violations| WS_SERVER
+    API -->|REST<br/>history, export, config| UI
+    WS_SERVER --> PIPELINE
+    PIPELINE --> M1 & M2 & M3 & M4 & M5
+    M1 --> V1 & V2 & V3 & V4
+    M2 --> V1
+    M3 --> V2
+    M4 --> V3
+    M5 --> V4
+    V1 & V2 & V3 & V4 --> DB
+    V1 & V2 & V3 & V4 --> EVIDENCE
+    DB --> CSV_EXPORT
+```
+
+## Luồng xử lý (Pipeline)
+
+```mermaid
+sequenceDiagram
+    participant C as Client Browser
+    participant WS as WebSocket Server
+    participant PM as Pipeline Manager
+    participant T as Vehicle Tracker
+    participant TL as Traffic Light
+    participant H as Helmet Detector
+    participant VC as Violation Checker
+    participant DB as SQLite
+
+    C->>WS: Connect + Start (source: webcam/video)
+    loop Every Frame
+        WS->>PM: Get frame from video source
+        par Parallel Inference
+            PM->>T: Track vehicles
+            PM->>TL: Detect traffic light
+            PM->>H: Detect helmet
+        end
+        T-->>PM: Boxes + Track IDs
+        TL-->>PM: Light state (red/green/yellow)
+        H-->>PM: Helmet/No-helmet boxes
+        PM->>VC: Check all violation rules
+        VC->>DB: Save violation (if any)
+        VC-->>PM: Annotated frame + violations list
+        PM-->>WS: Send annotated frame (JPEG)
+        WS-->>C: WebSocket binary (frame) + JSON (violations)
+    end
+    C->>WS: Stop
+```
+
 
 ---
 
