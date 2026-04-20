@@ -270,7 +270,7 @@ class DetectionPipeline:
         annotated = frame.copy()
         self._annotate_frame(
             annotated, v_boxes, v_ids, v_classes, v_confs,
-            vehicle_model, results, helmet_model, light_model,
+            vehicle_model, results, helmet_model, light_model, speed_model,
             light_status, vehicle_count, all_violations
         )
 
@@ -317,7 +317,7 @@ class DetectionPipeline:
 
     def _annotate_frame(
         self, frame, v_boxes, v_ids, v_classes, v_confs,
-        vehicle_model, results, helmet_model, light_model,
+        vehicle_model, results, helmet_model, light_model, speed_model,
         light_status, vehicle_count, violations
     ):
         """Vẽ bounding boxes, zones, labels, stats lên frame."""
@@ -408,6 +408,30 @@ class DetectionPipeline:
                 label = f"{cls_name} {conf_l:.2f}"
                 cv2.putText(frame, label, (x1, max(0, y1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+        # 4b. Vẽ biển báo tốc độ
+        if results.get("speed") is not None and speed_model:
+            SPEED_SIGN_COLOR = (0, 200, 255)   # Cam-cyan
+            for box in results["speed"].boxes:
+                cls_id = int(box.cls[0])
+                conf_s = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls_name = speed_model.names[cls_id]  # VD: "50", "60"...
+
+                # Vẽ khung và label
+                cv2.rectangle(frame, (x1, y1), (x2, y2), SPEED_SIGN_COLOR, 2)
+                sign_label = f"LIMIT {cls_name} km/h  {conf_s:.0%}"
+                cv2.putText(frame, sign_label, (x1, max(0, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, SPEED_SIGN_COLOR, 2, cv2.LINE_AA)
+
+                # Vẽ badge nền đặc trong góc trên phải biển
+                badge_text = f" {cls_name} "
+                (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                bx1, by1 = x2 - tw - 4, y1
+                bx2, by2 = x2, y1 + th + 6
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), SPEED_SIGN_COLOR, -1)
+                cv2.putText(frame, badge_text, (bx1, by2 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
 
         # 5. HUD overlay
         h, w = frame.shape[:2]
