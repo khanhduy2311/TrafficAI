@@ -54,7 +54,7 @@ EVIDENCE_DIR       = "violations/"
 VIOLATION_CSV_PATH = "output/violation_report.csv"
 TRACKER_CONFIG     = "bytetrack.yaml"
 
-VALID_SPEED_LIMITS = {15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120}
+VALID_SPEED_LIMITS = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLASSES

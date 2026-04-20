@@ -80,6 +80,18 @@ class RedLightChecker:
         self.light_history: deque = deque(maxlen=smooth_window)
         self.current_light_status: str = "unknown"
 
+        # [Fix #1]
+        self.zone1_light_state: dict = {}
+
+        # [Fix #2]
+        self.raw_transition_count: dict = defaultdict(int)
+        self.prev_raw_status: str = "unknown"
+        self.transition_confirm = 2
+
+        # [Fix #3]
+        self.last_seen_frame: dict = {}
+        self.grace_period_frames = 50  # ~2.0 * fps (assume 25fps)
+
         # ROI polygons — sẽ được set từ pipeline
         self.roi1_polygon: Optional[np.ndarray] = None
         self.roi2_polygon: Optional[np.ndarray] = None
@@ -141,11 +153,32 @@ class RedLightChecker:
                 if raw_status not in ("red", "yellow"):
                     raw_status = "green"
 
+        # [Fix #2] Smoothing + Hard transition logic
+        if raw_status != "unknown":
+            current_smoothed = (
+                max(set(self.light_history), key=list(self.light_history).count)
+                if self.light_history else "unknown"
+            )
+            if raw_status != current_smoothed:
+                if raw_status == self.prev_raw_status:
+                    self.raw_transition_count[raw_status] += 1
+                else:
+                    self.raw_transition_count.clear()
+                    self.raw_transition_count[raw_status] = 1
+
+                if self.raw_transition_count[raw_status] >= self.transition_confirm:
+                    self.light_history.clear()
+                    self.raw_transition_count.clear()
+            else:
+                self.raw_transition_count.clear()
+
+        self.prev_raw_status = raw_status
         self.light_history.append(raw_status)
+        
         # Voting: trạng thái xuất hiện nhiều nhất
-        self.current_light_status = max(
-            set(self.light_history), key=list(self.light_history).count
-        )
+        if self.light_history:
+            self.current_light_status = max(set(self.light_history), key=list(self.light_history).count)
+        
         return self.current_light_status
 
     def check_vehicles(
@@ -166,7 +199,6 @@ class RedLightChecker:
             return []
 
         violations = []
-        is_red = self.current_light_status == "red"
         current_ids = set()
 
         for box, track_id, cls_id, conf in zip(
@@ -175,6 +207,9 @@ class RedLightChecker:
             x1, y1, x2, y2 = map(int, box)
             track_id = int(track_id)
             current_ids.add(track_id)
+            
+            # [Fix #3] Cập nhật frame cuối cùng nhìn thấy xe
+            self.last_seen_frame[track_id] = frame_number
 
             # Bottom-center
             bc_x = (x1 + x2) // 2
@@ -187,31 +222,49 @@ class RedLightChecker:
                 self.roi2_polygon, (float(bc_x), float(bc_y)), False
             ) >= 0
 
+            # [Fix #1] Ghi nhận đèn hiện tại mỗi khi ở zone1
             if inside_roi1:
+                self.zone1_light_state[track_id] = self.current_light_status
                 self.vehicles_in_zone1.add(track_id)
+                self.zone2_frame_count[track_id] = 0
 
             if not inside_roi1 and not inside_roi2:
-                self.vehicles_in_zone1.discard(track_id)
-                self.zone2_frame_count[track_id] = 0
+                if track_id in self.vehicles_in_zone1:
+                    if self.current_light_status in ("green", "yellow", "off") and self.current_light_status != "unknown":
+                        self.zone1_light_state[track_id] = self.current_light_status
+                else:
+                    if self.zone2_frame_count[track_id] == 0 and track_id not in self.violators:
+                        self.zone1_light_state.pop(track_id, None)
 
             if inside_roi2:
                 self.zone2_frame_count[track_id] += 1
-            else:
+            elif not inside_roi1:
                 self.zone2_frame_count[track_id] = 0
 
-            consecutive = self.zone2_frame_count[track_id]
             last_vio = self.last_violation_frame.get(track_id, -999999)
             cooldown_ok = (frame_number - last_vio) > self.cooldown_frames
 
+            # [Fix #4] Quản lý violators
+            if track_id in self.violators and cooldown_ok:
+                self.violators.discard(track_id)
+
+            consecutive = self.zone2_frame_count[track_id]
+            crossed_on_red = self.zone1_light_state.get(track_id) == "red"
+
             if (
-                is_red
+                crossed_on_red
                 and inside_roi2
                 and track_id in self.vehicles_in_zone1
                 and consecutive >= self.frame_threshold
                 and cooldown_ok
+                and track_id not in self.violators
             ):
                 self.violators.add(track_id)
                 self.last_violation_frame[track_id] = frame_number
+                
+                # [Fix #5] Reset frame_count về âm
+                self.zone2_frame_count[track_id] = -self.frame_threshold
+                
                 cls_name = vehicle_model.names[int(cls_id)]
 
                 # Lưu evidence
@@ -228,6 +281,23 @@ class RedLightChecker:
                     bbox=[x1, y1, x2, y2],
                     evidence_path=evidence_path,
                 ))
+
+        # [Fix #3] DON DEP STATE VOI GRACE PERIOD
+        all_tracked_ids = set(self.vehicles_in_zone1) | set(self.zone1_light_state.keys())
+        for tid in list(all_tracked_ids):
+            if tid in current_ids:
+                continue
+                
+            frames_absent = frame_number - self.last_seen_frame.get(tid, frame_number)
+            if frames_absent > self.grace_period_frames:
+                self.vehicles_in_zone1.discard(tid)
+                self.zone1_light_state.pop(tid, None)
+                self.zone2_frame_count.pop(tid, None)
+                self.last_seen_frame.pop(tid, None)
+
+                if frame_number - self.last_violation_frame.get(tid, -999999) > self.cooldown_frames * 2:
+                    self.last_violation_frame.pop(tid, None)
+                    self.violators.discard(tid)
 
         return violations
 
@@ -263,6 +333,10 @@ class RedLightChecker:
         self.zone2_frame_count.clear()
         self.last_violation_frame.clear()
         self.light_history.clear()
+        self.zone1_light_state.clear()
+        self.raw_transition_count.clear()
+        self.last_seen_frame.clear()
+        self.prev_raw_status = "unknown"
         self.current_light_status = "unknown"
         self.roi1_polygon = None
         self.roi2_polygon = None
@@ -558,7 +632,7 @@ _MAX_PHYSICAL_KMH           = 150.0
 _MAX_FRAME_GAP              = 5
 _UNLOCK_DELTA_KMH           = 8.0
 _WARMUP_FRAMES              = 6
-_VALID_SPEED_LIMITS         = {15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120}
+_VALID_SPEED_LIMITS         = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
 _VALID_RADIUS_RATIO         = 1.0
 _SENSOR_FOV_DEG             = 185.0
 _REAL_RADIUS_METERS         = 25.0
