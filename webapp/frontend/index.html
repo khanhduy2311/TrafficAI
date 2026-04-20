@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Hệ thống phát hiện vi phạm giao thông realtime sử dụng AI - Traffic Violation Detection System">
+    <title>TrafficAI — Hệ Thống Phát Hiện Vi Phạm Giao Thông</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- ═══════ HEADER ═══════ -->
+    <header id="app-header">
+        <div class="header-left">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="url(#grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#06d6a0"/><stop offset="100%" style="stop-color:#7c3aed"/></linearGradient></defs>
+                        <circle cx="12" cy="12" r="10"/>
+                        <path d="M12 6v6l4 2"/>
+                    </svg>
+                </div>
+                <h1>Traffic<span class="accent">AI</span></h1>
+            </div>
+            <span class="version-badge">v1.0</span>
+        </div>
+
+        <div class="header-center">
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot offline"></span>
+                <span class="status-text">Chưa kết nối</span>
+            </div>
+        </div>
+
+        <div class="header-right">
+            <button class="icon-btn" id="btnExportCSV" title="Xuất báo cáo CSV">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <span>CSV</span>
+            </button>
+            <button class="icon-btn danger" id="btnClearHistory" title="Xoá lịch sử">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                <span>Xoá</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- ═══════ MAIN CONTENT ═══════ -->
+    <main id="app-main">
+        <!-- LEFT: Video Area -->
+        <section class="video-section">
+            <!-- Control Bar -->
+            <div class="control-bar">
+                <div class="source-selector">
+                    <button class="source-btn active" id="btnWebcam" data-source="webcam">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                        Webcam
+                    </button>
+                    <button class="source-btn" id="btnUrl" data-source="url">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                        URL Camera
+                    </button>
+                    <button class="source-btn" id="btnUpload" data-source="upload">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        Upload Video
+                    </button>
+                </div>
+                <div class="control-actions">
+                    <input type="text" id="urlInput" placeholder="Nhập RTSP/HTTP URL camera..." style="display:none; padding: 8px 12px; border-radius: 6px; border: 1px solid #222; background: #06060b; color: white; margin-right: 12px; width: 250px; outline: none; font-family: 'Inter', sans-serif;">
+                    <button class="btn-primary" id="btnStart">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        Bắt đầu
+                    </button>
+                    <button class="btn-secondary" id="btnStop" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                        Dừng
+                    </button>
+                </div>
+            </div>
+
+            <!-- Video Canvas -->
+            <div class="video-container" id="videoContainer">
+                <canvas id="videoCanvas"></canvas>
+                <div class="video-overlay" id="videoOverlay">
+                    <div class="overlay-content">
+                        <div class="pulse-ring"></div>
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1.5">
+                            <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/>
+                        </svg>
+                        <p>Chọn nguồn video và nhấn <strong>Bắt đầu</strong></p>
+                        <p class="hint">Hỗ trợ: Webcam, Nhập URL, Nhúng Video</p>
+                    </div>
+                </div>
+
+                <!-- Upload drop zone -->
+                <div class="drop-zone" id="dropZone">
+                    <div class="drop-content">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        <p>Kéo thả video vào đây</p>
+                        <p class="hint">hoặc <label for="fileInput" class="file-label">chọn file</label></p>
+                        <input type="file" id="fileInput" accept="video/*" hidden>
+                    </div>
+                </div>
+
+                <!-- FPS & Progress -->
+                <div class="video-hud">
+                    <span class="hud-fps" id="hudFps">-- FPS</span>
+                    <span class="hud-light" id="hudLight">
+                        <span class="light-dot" id="lightDot"></span>
+                        <span id="lightText">---</span>
+                    </span>
+                    <span class="hud-progress" id="hudProgress"></span>
+                </div>
+            </div>
+
+            <!-- Upload info bar -->
+            <div class="upload-info" id="uploadInfo" style="display:none">
+                <span class="upload-name" id="uploadName"></span>
+                <span class="upload-size" id="uploadSize"></span>
+                <button class="upload-remove" id="uploadRemove">&times;</button>
+            </div>
+        </section>
+
+        <!-- RIGHT: Violations Panel -->
+        <aside class="violations-section">
+            <div class="panel-header">
+                <h2>Vi Phạm Phát Hiện</h2>
+                <span class="violation-count" id="violationCount">0</span>
+            </div>
+
+            <div class="violation-filters">
+                <button class="filter-btn active" data-filter="all">Tất cả</button>
+                <button class="filter-btn" data-filter="red_light">
+                    <span class="filter-dot red"></span>Vượt đèn đỏ
+                </button>
+                <button class="filter-btn" data-filter="no_helmet">
+                    <span class="filter-dot orange"></span>Không mũ BH
+                </button>
+                <button class="filter-btn" data-filter="wrong_lane">
+                    <span class="filter-dot purple"></span>Sai làn
+                </button>
+                <button class="filter-btn" data-filter="speed_limit">
+                    <span class="filter-dot blue"></span>Quá tốc độ
+                </button>
+            </div>
+
+            <div class="violations-list" id="violationsList">
+                <div class="empty-state" id="emptyState">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1.5">
+                        <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    <p>Chưa phát hiện vi phạm</p>
+                    <p class="hint">Vi phạm sẽ hiển thị tại đây khi hệ thống đang chạy</p>
+                </div>
+            </div>
+        </aside>
+    </main>
+
+    <!-- ═══════ STATS BAR ═══════ -->
+    <footer id="stats-bar">
+        <div class="stat-card">
+            <div class="stat-icon vehicles">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statVehicles">0</span>
+                <span class="stat-label">Phương tiện</span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon redlight">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statRedLight">0</span>
+                <span class="stat-label">Vượt đèn đỏ</span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon helmet">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M12 8v4"/><circle cx="12" cy="16" r="1"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statHelmet">0</span>
+                <span class="stat-label">Không mũ BH</span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon lane">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statLane">0</span>
+                <span class="stat-label">Sai làn</span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon speed">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statSpeed">0</span>
+                <span class="stat-label">Quá tốc độ</span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon fps-stat">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            </div>
+            <div class="stat-info">
+                <span class="stat-value" id="statFps">--</span>
+                <span class="stat-label">FPS</span>
+            </div>
+        </div>
+    </footer>
+
+    <!-- ═══════ EVIDENCE MODAL ═══════ -->
+    <div class="modal-overlay" id="evidenceModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>Chi tiết vi phạm</h3>
+                <button class="modal-close" id="modalClose">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Filled dynamically -->
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ CONFIRM DIALOG ═══════ -->
+    <div class="modal-overlay" id="confirmDialog">
+        <div class="modal-card confirm-card">
+            <div class="modal-header">
+                <h3>Xác nhận</h3>
+            </div>
+            <div class="modal-body">
+                <p id="confirmText">Bạn có chắc muốn xoá toàn bộ lịch sử vi phạm?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="confirmCancel">Huỷ</button>
+                <button class="btn-danger" id="confirmOk">Xoá tất cả</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ TOAST CONTAINER ═══════ -->
+    <div id="toastContainer"></div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>
