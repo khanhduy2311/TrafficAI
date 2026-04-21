@@ -24,6 +24,8 @@ import argparse
 import cv2
 import json
 import hashlib
+import math
+import re
 import numpy as np
 from collections import defaultdict, deque
 from datetime import datetime
@@ -43,6 +45,7 @@ def parse_args():
     parser.add_argument("--source",           required=True,                            help="Duong dan video dau vao")
     parser.add_argument("--light-weights",    default="models/Den1.pt",          help="Model nhan dien den giao thong")
     parser.add_argument("--vehicle-weights",  default="models/Xe.pt",                   help="Model tracking xe")
+    parser.add_argument("--sign-weights",     default="",                               help="Model nhan dien bien bao toc do (Optional)")
     parser.add_argument("--output",           default="outputs/results/output.mp4",     help="Duong dan video ket qua")
     parser.add_argument("--evidence-dir",     default="outputs/violations",             help="Thu muc luu bang chung vi pham")
     parser.add_argument("--log-file",         default="outputs/violations/log.json",    help="File JSON luu log vi pham")
@@ -55,6 +58,7 @@ def parse_args():
     parser.add_argument("--light-conf",       type=float, default=0.25,                 help="Nguong confidence cho den do (khuyen nghi 0.3-0.5)")
     parser.add_argument("--vehicle-conf",     type=float, default=0.4,                  help="Nguong confidence cho phat hien xe")
     parser.add_argument("--frame-threshold",  type=int,   default=3,                    help="So frame lien tiep trong Zone 2 de xac nhan vi pham")
+    parser.add_argument("--speed-limit",      type=int,   default=50,                   help="Gioi han toc do mac dinh (km/h)")
     parser.add_argument("--cooldown-sec",     type=float, default=5.0,                  help="Thoi gian cho giua 2 vi pham cung mot xe (giay)")
     parser.add_argument("--smooth-window",    type=int,   default=10,                   help="Do dai cua so lam muot den (so frame de bo phieu)")
     parser.add_argument("--grace-period-sec", type=float, default=2.0,                  help="[Fix #3] Thoi gian cho khi xe mat track tam thoi (giay)")
@@ -122,6 +126,84 @@ def draw_zone(frame, polygon, color, label, alpha=0.25):
         origin = tuple(polygon[0][0])
         cv2.putText(frame, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
+# ──────────────────────────────────────────────────────────
+# 3. PERSPECTIVE SPEED ESTIMATOR (Logic from violation_checker.py)
+# ──────────────────────────────────────────────────────────
+
+_SPEED_MEDIAN_WINDOW = 15
+_MAX_PHYSICAL_KMH = 120.0
+_MAX_FRAME_GAP = 4
+_WARMUP_FRAMES = 10
+_CAMERA_HEIGHT_M = 6.0
+_FOCAL_LENGTH_PX = 400.0
+_GLOBAL_SPEED_SCALE = 0.8
+_VALID_SPEED_LIMITS = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
+
+class PerspectiveSpeedEstimator:
+    def __init__(self, fps: float):
+        self.fps = fps
+        self._tracks = {}
+
+    def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int) -> int:
+        x1, y1, x2, y2 = bbox
+        cx_px = (x1 + x2) / 2.0
+        cy_px = (y1 + y2) / 2.0
+        bh_px = float(y2 - y1)
+
+        if bh_px < 8: return 0
+
+        if track_id not in self._tracks:
+            self._tracks[track_id] = {
+                "history": deque(maxlen=12),
+                "speeds": deque(maxlen=_SPEED_MEDIAN_WINDOW),
+                "ema_speed": 0.0,
+                "warmup": 0
+            }
+
+        track = self._tracks[track_id]
+        track["warmup"] += 1
+        history = track["history"]
+
+        if history:
+            prev_cx, prev_cy, prev_bh, prev_idx = history[-1]
+            frame_gap = frame_idx - prev_idx
+
+            if frame_gap > _MAX_FRAME_GAP:
+                self._reset_track(track, cx_px, cy_px, bh_px, frame_idx)
+                return 0
+
+            dt = frame_gap / self.fps if self.fps > 0 else 0.0
+            if dt > 0:
+                avg_bh = (bh_px + prev_bh) / 2.0
+                depth_m = (_CAMERA_HEIGHT_M * _FOCAL_LENGTH_PX) / max(avg_bh, 1.0)
+                dpx = math.hypot(cx_px - prev_cx, cy_px - prev_cy)
+                dist_m = (dpx * depth_m / _FOCAL_LENGTH_PX) * _GLOBAL_SPEED_SCALE
+                inst_kmh = (dist_m / dt) * 3.6
+
+                if inst_kmh > _MAX_PHYSICAL_KMH:
+                    inst_kmh = track["speeds"][-1] if track["speeds"] else 0.0
+
+                track["speeds"].append(inst_kmh)
+                if track["warmup"] > _WARMUP_FRAMES:
+                    median_speed = float(np.median(track["speeds"]))
+                    if track["ema_speed"] == 0: track["ema_speed"] = median_speed
+                    else: track["ema_speed"] = 0.75 * track["ema_speed"] + 0.25 * median_speed
+                    history.append((cx_px, cy_px, bh_px, frame_idx))
+                    return int(round(track["ema_speed"]))
+
+        history.append((cx_px, cy_px, bh_px, frame_idx))
+        return 0
+
+    def _reset_track(self, track, cx, cy, bh, idx):
+        track["history"].clear()
+        track["speeds"].clear()
+        track["ema_speed"] = 0.0
+        track["warmup"] = 1
+        track["history"].append((cx, cy, bh, idx))
+
+    def remove_track(self, track_id: int):
+        self._tracks.pop(track_id, None)
+
 
 # ──────────────────────────────────────────────────────────
 # 3. MAIN
@@ -147,6 +229,7 @@ def main():
     print("\n[1/4] Load models...")
     light_model   = YOLO(args.light_weights)
     vehicle_model = YOLO(args.vehicle_weights)
+    sign_model    = YOLO(args.sign_weights) if args.sign_weights else None
     print("  Light model classes :")
     light_class_map = get_light_class_map(light_model)
 
@@ -213,6 +296,14 @@ def main():
     light_history            = deque(maxlen=args.smooth_window)
     raw_transition_count     = defaultdict(int)   # dem raw status lien tiep de phat hien hard transition
     prev_raw_status          = "unknown"
+
+    # --- Speed Estimation State ---
+    speed_estimator = PerspectiveSpeedEstimator(fps=float(fps))
+    current_speed_limit = args.speed_limit
+    speed_violated_ids = set()
+    speed_cooldown_frames = int(90) # ~3-4s
+    last_speed_violation_frame = {}
+    speed_map = {} # track_id -> toc do de hien thi
 
     # Buffer de luu clip (neu --save-clip)
     CLIP_BUFFER_SEC = 3
@@ -523,16 +614,42 @@ def main():
                     }
                     violation_log.append(log_entry)
 
+                # ──────────────────────────────────────────────
+                # BUOC 4: uoc tinh toc do & check vi pham toc do
+                # ──────────────────────────────────────────────
+                speed = speed_estimator.estimate_speed(track_id, (x1, y1, x2, y2), frame_count)
+                speed_map[track_id] = speed
+
+                if speed > current_speed_limit:
+                    last_s_vio = last_speed_violation_frame.get(track_id, -9999)
+                    if (frame_count - last_s_vio) > speed_cooldown_frames:
+                        last_speed_violation_frame[track_id] = frame_count
+                        # Log speed violation
+                        print(f"[Frame {frame_count}] !!! TOC DO !!! ID:{track_id} | {speed}km/h | Limit:{current_speed_limit}")
+                        
+                        # (Ghi log tuong tu red light - o day rut gon de de doc)
+                        log_entry_speed = {
+                            "track_id": track_id,
+                            "type": "speed_limit",
+                            "speed": speed,
+                            "limit": current_speed_limit,
+                            "frame": frame_count,
+                            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
+                        }
+                        violation_log.append(log_entry_speed)
+
                 # Mau sac box xe
-                if track_id in violators:
+                is_speeding = (speed > current_speed_limit)
+                if track_id in violators or is_speeding:
                     box_color  = (0, 0, 255)
                     box_label  = "VI PHAM"
+                    if is_speeding: box_label += f" {speed}km/h"
                 elif track_id in vehicles_in_zone1:
                     box_color  = (255, 0, 255)
-                    box_label  = "THEO DOI"
+                    box_label  = f"THEO DOI {speed}km/h"
                 else:
                     box_color  = (255, 120, 0)
-                    box_label  = ""
+                    box_label  = f"{speed}km/h"
 
                 cls_name   = vehicle_model.names[cls_id]
                 label_text = f"ID:{track_id} {cls_name} {box_label}".strip()
@@ -568,8 +685,10 @@ def main():
         # Hien thi thong ke tren frame
         cv2.putText(frame, f"Tong vi pham: {len(violation_log)}",
                     (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Limit: {current_speed_limit} km/h",
+                    (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f"Frame: {frame_count}/{total}",
-                    (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+                    (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
 
         out.write(frame)
 
