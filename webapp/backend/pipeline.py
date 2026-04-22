@@ -1,6 +1,7 @@
 """
 Detection Pipeline — Orchestrate multi-model inference in parallel
 Xử lý frame: chạy các model song song → merge → check violations → annotate
+Tích hợp WrongWayChecker (xe đi ngược chiều) vào WrongLaneChecker.
 """
 
 import cv2
@@ -32,9 +33,10 @@ VEHICLE_COLORS = {
 }
 
 VIOLATION_COLORS = {
-    "red_light": (0, 0, 255),
-    "no_helmet": (0, 100, 255),
+    "red_light":  (0, 0, 255),
+    "no_helmet":  (0, 100, 255),
     "wrong_lane": (255, 0, 100),
+    "wrong_way":  (0, 0, 200),      # Đỏ đậm — ngược chiều
     "speed_limit": (100, 0, 255),
 }
 
@@ -63,8 +65,8 @@ class DetectionPipeline:
     Pipeline xử lý video:
     1. Đọc frame từ source (video file hoặc webcam)
     2. Chạy multi-model song song (ThreadPoolExecutor)
-    3. Check violations
-    4. Annotate frame
+    3. Check violations (bao gồm wrong-way từ WrongLaneChecker)
+    4. Annotate frame (vẽ velocity arrows, wrong-way zones)
     5. Trả kết quả
     """
 
@@ -86,17 +88,22 @@ class DetectionPipeline:
         self.frame_count: int = 0
 
         # Violation checkers
-        self.red_light_checker = RedLightChecker()
-        self.no_helmet_checker = NoHelmetChecker()
-        self.wrong_lane_checker = WrongLaneChecker()
+        self.red_light_checker   = RedLightChecker()
+        self.no_helmet_checker   = NoHelmetChecker()
+        self.wrong_lane_checker  = WrongLaneChecker()   # ← bao gồm WrongWayChecker
         self.speed_limit_checker = SpeedLimitChecker()
 
         # Running state
         self.is_running: bool = False
 
+        # Wrong-way ROI zones: list of polygon [(x,y),...]
+        # Nếu None → sẽ tự set từ frame size khi start()
+        # Bạn có thể truyền vào trước khi gọi start() để dùng polygon tùy chỉnh
+        self.wrong_way_roi_zones: Optional[list] = None
+
     def start(self, source: str = "webcam", video_path: str = ""):
         """Khởi tạo pipeline với nguồn video."""
-        self.session_id = str(uuid.uuid4())[:8]
+        self.session_id  = str(uuid.uuid4())[:8]
         self.frame_count = 0
         self.source_type = source
 
@@ -119,9 +126,9 @@ class DetectionPipeline:
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source} / {video_path}")
 
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_width  = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.source_fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 25
+        self.source_fps   = int(self.cap.get(cv2.CAP_PROP_FPS)) or 25
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         # Set ROI cho red_light_checker
@@ -129,9 +136,20 @@ class DetectionPipeline:
             self.frame_width, self.frame_height
         )
 
+        # ── Set ROI cho WrongWayChecker (tích hợp trong WrongLaneChecker) ──
+        if self.wrong_way_roi_zones:
+            # Dùng polygon tùy chỉnh do user cung cấp
+            self.wrong_lane_checker.set_wrong_way_roi(self.wrong_way_roi_zones)
+        else:
+            # Tự tạo ROI mặc định từ kích thước frame
+            self.wrong_lane_checker.set_wrong_way_roi_from_frame(
+                self.frame_width, self.frame_height
+            )
+
         self.is_running = True
         print(f"[Pipeline] Started — {self.frame_width}x{self.frame_height} "
               f"@{self.source_fps}fps, session={self.session_id}")
+        print(f"[Pipeline] WrongWayChecker: ROI={'custom' if self.wrong_way_roi_zones else 'auto'}")
 
     def stop(self):
         """Dừng pipeline."""
@@ -184,14 +202,14 @@ class DetectionPipeline:
                 self._run_helmet_detector, helmet_model, original_frame
             )
 
-        # 1d. Lane sign detector (placeholder)
+        # 1d. Lane sign detector
         lane_model = models_manager.get("lane_sign")
         if lane_model:
             futures["lane"] = self.executor.submit(
                 self._run_lane_detector, lane_model, original_frame
             )
 
-        # 1e. Speed sign detector (placeholder)
+        # 1e. Speed sign detector
         speed_model = models_manager.get("speed_sign")
         if speed_model:
             futures["speed"] = self.executor.submit(
@@ -208,48 +226,55 @@ class DetectionPipeline:
                 results[name] = None
 
         # ═══════════════════════════════════════════════
-        # BƯỚC 2: CHECK VIOLATIONS
+        # BƯỚC 2: PARSE VEHICLE RESULTS
+        # ═══════════════════════════════════════════════
+        v_boxes   = np.empty((0, 4))
+        v_ids     = np.empty((0,), dtype=int)
+        v_classes = np.empty((0,), dtype=int)
+        v_confs   = np.empty((0,))
+        vehicle_count = 0
+        light_status  = "unknown"
+
+        if results.get("vehicle") is not None and vehicle_model:
+            vr = results["vehicle"]
+            if vr.boxes.id is not None:
+                v_boxes   = vr.boxes.xyxy.cpu().numpy()
+                v_ids     = vr.boxes.id.cpu().numpy().astype(int)
+                v_classes = vr.boxes.cls.cpu().numpy().astype(int)
+                v_confs   = vr.boxes.conf.cpu().numpy()
+                vehicle_count = len(v_ids)
+
+        # ═══════════════════════════════════════════════
+        # BƯỚC 3: CHECK VIOLATIONS
         # ═══════════════════════════════════════════════
         all_violations: list[ViolationEvent] = []
-        vehicle_count = 0
-        light_status = "unknown"
 
         # --- Traffic light ---
         if results.get("light") is not None and light_model:
             light_status = self.red_light_checker.update_light_status(
                 results["light"], light_model, self.frame_height
             )
-
-        # --- Vehicle tracking + Red light check ---
-        v_boxes, v_ids, v_classes, v_confs = [], [], [], []
-        if results.get("vehicle") is not None:
-            vr = results["vehicle"]
-            if vr.boxes.id is not None:
-                v_boxes = vr.boxes.xyxy.cpu().numpy()
-                v_ids = vr.boxes.id.int().cpu().numpy()
-                v_classes = vr.boxes.cls.int().cpu().numpy()
-                v_confs = vr.boxes.conf.cpu().numpy()
-                vehicle_count = len(v_boxes)
-
-                # Red light violations
-                red_violations = self.red_light_checker.check_vehicles(
+            if len(v_boxes) > 0:
+                rl_violations = self.red_light_checker.check_vehicles(
                     v_boxes, v_ids, v_classes, v_confs,
                     vehicle_model, self.frame_count, original_frame
                 )
-                all_violations.extend(red_violations)
+                all_violations.extend(rl_violations)
 
-        # --- Helmet check ---
+        # --- No helmet ---
         if results.get("helmet") is not None and helmet_model:
-            helmet_violations = self.no_helmet_checker.check(
+            h_violations = self.no_helmet_checker.check(
                 results["helmet"], helmet_model,
                 self.frame_count, original_frame
             )
-            all_violations.extend(helmet_violations)
+            all_violations.extend(h_violations)
 
-        # --- Lane check (placeholder) ---
-        if results.get("lane") is not None and lane_model and len(v_boxes) > 0:
+        # --- Wrong lane + Wrong way (cùng nhóm, xử lý chung) ---
+        # WrongLaneChecker.check() gọi cả _check_wrong_lane và wrong_way_checker.check()
+        if len(v_boxes) > 0:
             lane_violations = self.wrong_lane_checker.check(
-                results["lane"], v_boxes, v_ids, v_classes, v_confs,
+                results.get("lane"),
+                v_boxes, v_ids, v_classes, v_confs,
                 vehicle_model, self.frame_count, original_frame
             )
             all_violations.extend(lane_violations)
@@ -265,7 +290,7 @@ class DetectionPipeline:
             all_violations.extend(speed_violations)
 
         # ═══════════════════════════════════════════════
-        # BƯỚC 3: ANNOTATE FRAME
+        # BƯỚC 4: ANNOTATE FRAME
         # ═══════════════════════════════════════════════
         annotated = frame.copy()
         self._annotate_frame(
@@ -320,52 +345,82 @@ class DetectionPipeline:
         vehicle_model, results, helmet_model, light_model, speed_model,
         light_status, vehicle_count, violations
     ):
-        """Vẽ bounding boxes, zones, labels, stats lên frame."""
+        """Vẽ bounding boxes, zones, labels, stats, velocity arrows lên frame."""
 
-        # 1. Vẽ zones (red light & wrong lane & speed safe-zone)
+        # 1. Vẽ zones
         self.red_light_checker.draw_zones(frame)
-        self.wrong_lane_checker.draw_zones(frame)
+        self.wrong_lane_checker.draw_zones(frame)   # ← vẽ cả wrong-lane & wrong-way zones
         self.speed_limit_checker.draw_safe_zone(frame)
 
-        # 2. Vẽ vehicle boxes
-        violated_ids      = self.red_light_checker.violators
-        lane_violated_ids = self.wrong_lane_checker.violated_ids
+        # 2. Tập hợp violated IDs từ tất cả checkers
+        rl_violated_ids    = self.red_light_checker.violators
+        lane_violated_ids  = self.wrong_lane_checker.violated_ids
+        # Wrong-way violated IDs (qua property)
+        ww_violated_ids    = self.wrong_lane_checker.wrong_way_violated_ids
         speed_violated_ids = self.speed_limit_checker.violated_ids
         speed_map          = self.speed_limit_checker.speed_map
 
-        for box, tid, cls_id, conf in zip(v_boxes, v_ids, v_classes, v_confs):
-            x1, y1, x2, y2 = map(int, box)
-            tid = int(tid)
-            cls_name = vehicle_model.names[int(cls_id)]
+        if vehicle_model and len(v_boxes) > 0:
+            for box, tid, cls_id, conf in zip(v_boxes, v_ids, v_classes, v_confs):
+                x1, y1, x2, y2 = map(int, box)
+                tid = int(tid)
+                cls_name = vehicle_model.names[int(cls_id)]
 
-            if tid in violated_ids or tid in lane_violated_ids or tid in speed_violated_ids:
-                color = (0, 0, 255)
-                extra = " [VI PHAM]"
-            elif tid in self.red_light_checker.vehicles_in_zone1:
-                color = (255, 0, 255)
-                extra = ""
-            else:
-                color = VEHICLE_COLORS.get(cls_name, (0, 255, 0))
-                extra = ""
+                # Xác định màu & nhãn vi phạm
+                if tid in rl_violated_ids:
+                    color = VIOLATION_COLORS["red_light"]
+                    viol_tag = " [DO]"
+                elif tid in ww_violated_ids:
+                    color = VIOLATION_COLORS["wrong_way"]
+                    viol_tag = " [NGUOC CHIEU]"
+                elif tid in lane_violated_ids:
+                    color = VIOLATION_COLORS["wrong_lane"]
+                    viol_tag = " [SAI LAN]"
+                elif tid in speed_violated_ids:
+                    color = VIOLATION_COLORS["speed_limit"]
+                    viol_tag = " [TOC DO]"
+                elif tid in self.red_light_checker.vehicles_in_zone1:
+                    color = (255, 0, 255)
+                    viol_tag = ""
+                else:
+                    color = VEHICLE_COLORS.get(cls_name, (0, 255, 0))
+                    viol_tag = ""
 
-            lane_info = ""
-            if tid in self.wrong_lane_checker.lane_map:
-                lane_info = f" | {self.wrong_lane_checker.lane_map[tid]}"
-                if tid in self.wrong_lane_checker.direction_map:
-                    lane_info += f" -> {self.wrong_lane_checker.direction_map[tid]}"
+                # Thông tin làn đường
+                lane_info = ""
+                if tid in self.wrong_lane_checker.lane_map:
+                    lane_info = f" | {self.wrong_lane_checker.lane_map[tid]}"
+                    if tid in self.wrong_lane_checker.direction_map:
+                        lane_info += f"->{self.wrong_lane_checker.direction_map[tid]}"
 
-            speed_info = ""
-            if tid in speed_map:
-                speed_info = f" {speed_map[tid]}km/h"
+                # Thông tin wrong-way cosine (debug)
+                ww_info = ""
+                if tid in ww_violated_ids or self.wrong_lane_checker.wrong_way_checker.is_wrong_way(tid):
+                    dbg = self.wrong_lane_checker.wrong_way_checker.get_debug_info(tid)
+                    # Chỉ lấy cos value ngắn gọn
+                    for part in dbg.split():
+                        if part.startswith("cos="):
+                            ww_info = f" {part}"
+                            break
 
-            label = f"{cls_name} ID:{tid}{lane_info}{speed_info}{extra}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label, (x1, max(0, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2, cv2.LINE_AA)
+                # Thông tin tốc độ
+                speed_info = ""
+                if tid in speed_map:
+                    speed_info = f" {speed_map[tid]}km/h"
 
-            # Bottom center dot
-            bc_x, bc_y = (x1 + x2) // 2, y2
-            cv2.circle(frame, (bc_x, bc_y), 4, (255, 255, 0), -1)
+                label = f"{cls_name} ID:{tid}{lane_info}{ww_info}{speed_info}{viol_tag}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, label, (x1, max(0, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+                # Bottom center dot
+                bc_x, bc_y = (x1 + x2) // 2, y2
+                cv2.circle(frame, (bc_x, bc_y), 4, (255, 255, 0), -1)
+
+            # 2b. Vẽ velocity arrows (hướng di chuyển) cho WrongWayChecker
+            self.wrong_lane_checker.wrong_way_checker.draw_velocity_arrows(
+                frame, v_boxes, v_ids, v_classes, vehicle_model
+            )
 
         # 3. Vẽ helmet detection boxes
         if results.get("helmet") is not None and helmet_model:
@@ -411,20 +466,18 @@ class DetectionPipeline:
 
         # 4b. Vẽ biển báo tốc độ
         if results.get("speed") is not None and speed_model:
-            SPEED_SIGN_COLOR = (0, 200, 255)   # Cam-cyan
+            SPEED_SIGN_COLOR = (0, 200, 255)
             for box in results["speed"].boxes:
                 cls_id = int(box.cls[0])
                 conf_s = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls_name = speed_model.names[cls_id]  # VD: "50", "60"...
+                cls_name = speed_model.names[cls_id]
 
-                # Vẽ khung và label
                 cv2.rectangle(frame, (x1, y1), (x2, y2), SPEED_SIGN_COLOR, 2)
                 sign_label = f"LIMIT {cls_name} km/h  {conf_s:.0%}"
                 cv2.putText(frame, sign_label, (x1, max(0, y1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, SPEED_SIGN_COLOR, 2, cv2.LINE_AA)
 
-                # Vẽ badge nền đặc trong góc trên phải biển
                 badge_text = f" {cls_name} "
                 (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
                 bx1, by1 = x2 - tw - 4, y1
@@ -449,14 +502,29 @@ class DetectionPipeline:
             cv2.putText(frame, f"Limit: {limit_val} km/h", (15, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1, cv2.LINE_AA)
 
+        # Scene flow (hướng luồng xe) — debug info
+        flow = self.wrong_lane_checker.wrong_way_checker._scene_flow.get_flow_vector()
+        if flow is not None:
+            fx, fy = flow
+            cv2.putText(frame, f"Flow:({fx:+.1f},{fy:+.1f})", (15, 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
+
         total_vio = (
             len(self.red_light_checker.violators)
             + len(self.no_helmet_checker.violated_ids)
             + len(self.wrong_lane_checker.violated_ids)
+            + len(self.wrong_lane_checker.wrong_way_violated_ids)
             + len(self.speed_limit_checker.violated_ids)
         )
         cv2.putText(frame, f"Violations: {total_vio}",
-                    (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 1, cv2.LINE_AA)
+                    (15, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 1, cv2.LINE_AA)
+
+        # Hiển thị số xe đi ngược chiều riêng
+        ww_count = len(self.wrong_lane_checker.wrong_way_violated_ids)
+        if ww_count > 0:
+            cv2.putText(frame, f"Wrong Way: {ww_count}",
+                        (15, 162), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
         cv2.putText(frame, f"Frame: {self.frame_count}",
                     (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (150, 150, 150), 1, cv2.LINE_AA)

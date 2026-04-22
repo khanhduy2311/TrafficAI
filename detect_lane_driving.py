@@ -120,8 +120,13 @@ while cap.isOpened():
         cls_id = int(box.cls[0])
         class_name = model_vehicle.names[cls_id]
 
-        if class_name == "Pedestrian":
-            continue
+        BIKE_PED_GROUP = {'Bike', 'Pedestrian'}
+
+        # ===== CLASS MERGE (SAME TRACK ID) =====
+        if track_id in last_positions:
+            old_cls = last_positions[track_id][4]
+            if old_cls in BIKE_PED_GROUP and class_name in BIKE_PED_GROUP:
+                class_name = old_cls
 
         # ===== RECONNECT =====
         if track_id not in last_positions:
@@ -136,16 +141,34 @@ while cap.isOpened():
                     old_w = old_x2 - old_x1
                     new_w = x2 - x1
 
+                    cls_match = (old_cls == class_name) or (old_cls in BIKE_PED_GROUP and class_name in BIKE_PED_GROUP)
+
                     if (
                         dist < 50
                         and frames_passed < 45
                         and dy < 0
                         and abs(old_w - new_w) < 40
-                        and old_cls == class_name
+                        and cls_match
                     ):
+                        if old_cls in BIKE_PED_GROUP and class_name in BIKE_PED_GROUP:
+                            class_name = old_cls
+                            
+                        # Transfer all previous tracking states
                         if old_id in valid_ids:
                             valid_ids.add(track_id)
+                        if old_id in lane_map:
+                            lane_map[track_id] = lane_map[old_id]
+                        if old_id in direction_map:
+                            direction_map[track_id] = direction_map[old_id]
+                        if old_id in violation_ids:
+                            violation_ids.add(track_id)
+                        if old_id in violation_log:
+                            violation_log[track_id] = violation_log[old_id]
                         break
+
+        # ===== FILTER AFTER MERGE =====
+        if class_name == "Pedestrian":
+            continue
 
         last_positions[track_id] = (cx, cy, frame_count, (x1, y1, x2, y2), class_name)
 
