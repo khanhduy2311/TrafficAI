@@ -1,0 +1,5 @@
+train: /workspace/datasets/yolo_stage_2/train/images
+val: /workspace/datasets/yolo_stage_2/train/images
+
+nc: 5
+names: ['bus', 'bike', 'car', 'pedestrian', 'truck']

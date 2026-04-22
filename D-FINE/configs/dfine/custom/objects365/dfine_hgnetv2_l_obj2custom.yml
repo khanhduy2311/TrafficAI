@@ -1,0 +1,53 @@
+__include__: [
+  '../../../dataset/fe9k.yml',
+  '../../../runtime.yml',
+  '../../include/dataloader_finetune_960.yml',
+  '../../include/optimizer.yml',
+  '../../include/dfine_hgnetv2_960.yml',
+]
+
+output_dir: ./output/dfine_l_finetune_stage_1
+
+
+DFINE:
+  backbone: HGNetv2
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [1, 2, 3]
+  freeze_stem_only: True
+  freeze_at: 0
+  freeze_norm: True
+  pretrained: False
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0000015625
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  lr: 0.00003125
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+
+epochs: 10 # Early stop
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: 0
+  collate_fn:
+    stop_epoch: 100
+    ema_restart_decay: 0.9999
+    base_size_repeat: 4
+
+ema:
+  warmups: 0
+
+lr_warmup_scheduler:
+  warmup_duration: 0

@@ -1,0 +1,55 @@
+Determining if the pthread_create exist failed with the following output:
+Change Dir: /workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp
+
+Run Build Command:"/usr/bin/make" "cmTC_872d2/fast"
+/usr/bin/make -f CMakeFiles/cmTC_872d2.dir/build.make CMakeFiles/cmTC_872d2.dir/build
+make[1]: Entering directory '/workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp'
+Building CXX object CMakeFiles/cmTC_872d2.dir/CheckSymbolExists.cxx.o
+/usr/bin/c++    -std=gnu++1z -o CMakeFiles/cmTC_872d2.dir/CheckSymbolExists.cxx.o -c /workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp/CheckSymbolExists.cxx
+Linking CXX executable cmTC_872d2
+/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_872d2.dir/link.txt --verbose=1
+/usr/bin/c++       CMakeFiles/cmTC_872d2.dir/CheckSymbolExists.cxx.o  -o cmTC_872d2 
+CMakeFiles/cmTC_872d2.dir/CheckSymbolExists.cxx.o: In function `main':
+CheckSymbolExists.cxx:(.text+0x1b): undefined reference to `pthread_create'
+collect2: error: ld returned 1 exit status
+CMakeFiles/cmTC_872d2.dir/build.make:97: recipe for target 'cmTC_872d2' failed
+make[1]: *** [cmTC_872d2] Error 1
+make[1]: Leaving directory '/workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp'
+Makefile:126: recipe for target 'cmTC_872d2/fast' failed
+make: *** [cmTC_872d2/fast] Error 2
+
+File /workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp/CheckSymbolExists.cxx:
+/* */
+#include <pthread.h>
+
+int main(int argc, char** argv)
+{
+  (void)argv;
+#ifndef pthread_create
+  return ((int*)(&pthread_create))[argc];
+#else
+  (void)argc;
+  return 0;
+#endif
+}
+
+Determining if the function pthread_create exists in the pthreads failed with the following output:
+Change Dir: /workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp
+
+Run Build Command:"/usr/bin/make" "cmTC_24382/fast"
+/usr/bin/make -f CMakeFiles/cmTC_24382.dir/build.make CMakeFiles/cmTC_24382.dir/build
+make[1]: Entering directory '/workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp'
+Building CXX object CMakeFiles/cmTC_24382.dir/CheckFunctionExists.cxx.o
+/usr/bin/c++    -DCHECK_FUNCTION_EXISTS=pthread_create   -std=gnu++1z -o CMakeFiles/cmTC_24382.dir/CheckFunctionExists.cxx.o -c /workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CheckLibraryExists/CheckFunctionExists.cxx
+Linking CXX executable cmTC_24382
+/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_24382.dir/link.txt --verbose=1
+/usr/bin/c++   -DCHECK_FUNCTION_EXISTS=pthread_create    CMakeFiles/cmTC_24382.dir/CheckFunctionExists.cxx.o  -o cmTC_24382 -lpthreads 
+/usr/bin/ld: cannot find -lpthreads
+collect2: error: ld returned 1 exit status
+CMakeFiles/cmTC_24382.dir/build.make:97: recipe for target 'cmTC_24382' failed
+make[1]: *** [cmTC_24382] Error 1
+make[1]: Leaving directory '/workspace/Repos/maibel/D-FINE/tools/inference/cppExample/trt/para/build/CMakeFiles/CMakeTmp'
+Makefile:126: recipe for target 'cmTC_24382/fast' failed
+make: *** [cmTC_24382/fast] Error 2
+
+
