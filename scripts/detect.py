@@ -41,8 +41,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--source",           required=True,                            help="Duong dan video dau vao")
-    parser.add_argument("--light-weights",    default="models/Den1.pt",          help="Model nhan dien den giao thong")
-    parser.add_argument("--vehicle-weights",  default="models/Xe.pt",                   help="Model tracking xe")
+    parser.add_argument("--light-weights",    default="models/yolov11_traffic_light.pt",          help="Model nhan dien den giao thong")
+    parser.add_argument("--vehicle-weights",  default="models/yolov11_vehicle.pt",                   help="Model tracking xe")
     parser.add_argument("--output",           default="outputs/results/output.mp4",     help="Duong dan video ket qua")
     parser.add_argument("--evidence-dir",     default="outputs/violations",             help="Thu muc luu bang chung vi pham")
     parser.add_argument("--log-file",         default="outputs/violations/log.json",    help="File JSON luu log vi pham")
@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument("--save-clip",        action="store_true",                      help="Luu clip ngan 5 giay cho moi vi pham (RAM cao hon)")
     parser.add_argument("--no-view",          action="store_true",                      help="Khong hien thi cua so xem truc tiep")
     parser.add_argument("--hide-light-roi",   action="store_true",                      help="Khong hien thi vung quet den tren video")
+    parser.add_argument("--config",           default="configs/roi_config.json",         help="Duong dan file JSON cau hinh ROI")
     return parser.parse_args()
 
 
@@ -86,6 +87,18 @@ def get_light_class_map(model) -> dict:
         else:
             print(f"  Den '{k}' -> class_id(s): {v}")
     return mapping
+
+
+def load_config(config_path: str) -> dict:
+    """Load cau hinh ROI tu file JSON."""
+    path = Path(config_path)
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"  WARNING: Khong the doc file config {config_path}: {e}")
+    return {}
 
 
 def parse_polygon(roi_str: str, default_poly: np.ndarray) -> np.ndarray:
@@ -164,6 +177,21 @@ def main():
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps, (width, height)
     )
+
+    # --- Load config tu JSON ---
+    config_data = load_config(args.config)
+    if config_data:
+        print(f"  [CONFIG] Da load cau hinh tu {args.config}")
+        # Ghi de neu tham so dong lenh dang de trong (default)
+        if not args.roi1 and "roi1" in config_data:
+            args.roi1 = config_data["roi1"]
+            print(f"    - ROI1: Load tu config")
+        if not args.roi2 and "roi2" in config_data:
+            args.roi2 = config_data["roi2"]
+            print(f"    - ROI2: Load tu config")
+        if not args.light_roi and "light_roi" in config_data:
+            args.light_roi = config_data["light_roi"]
+            print(f"    - Light ROI: {len(args.light_roi)} vung load tu config")
 
     # --- Dinh nghia ROI ---
     print("\n[3/4] Cau hinh vung ROI...")

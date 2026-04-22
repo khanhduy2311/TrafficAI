@@ -1,0 +1,10 @@
+path: D:/Detect/Datav2
+train: train/images
+val: valid/images
+test: test/images
+
+names:
+  0: "green"
+  1: "off"
+  2: "red"
+  3: "yellow"

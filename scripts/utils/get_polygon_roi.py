@@ -1,10 +1,12 @@
 import cv2
 import argparse
+import json
 from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Tool tra cuu toa do Polylines tren Camera")
     parser.add_argument("--source", required=True, help="Duong dan video hinh anh can do toa do")
+    parser.add_argument("--output-config", default="configs/roi_config.json", help="Duong dan file JSON de luu cau hinh (mac dinh: configs/roi_config.json)")
     return parser.parse_args()
 
 points = []
@@ -115,18 +117,37 @@ def main():
         
         # Xu ly Light ROIs (Vung 3 tro di)
         light_rois_list = []
+        light_rois_raw = []
         if len(roi_list) >= 3:
             for i in range(2, len(roi_list)):
                 coords = [str(c) for p in roi_list[i] for c in p]
+                light_rois_raw.append(",".join(coords))
                 light_rois_list.append(f'"{",".join(coords)}"')
         
+        # Luu vao JSON
+        config_data = {
+            "source": str(args.source),
+            "roi1": r1_str,
+            "roi2": r2_str,
+            "light_roi": light_rois_raw,
+            "updated_at": Path(args.source).stat().st_mtime if Path(args.source).exists() else 0
+        }
+        
+        output_path = Path(args.output_config)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4)
+        
+        print("\n" + "="*50)
+        print(f" DA LUU CAU HINH VAO: {output_path}")
+        print("="*50)
+
         light_cmd = ""
         if light_rois_list:
             light_cmd = " --light-roi " + " ".join(light_rois_list)
         
-        print("\n\n======== KET QUA ROI TRAM ==========")
-        print("======== COPY LENH SAU VA CHAY TRONG CONSOLE ==========")
+        print("\nHoac ban co the chay lenh thu cong:")
         print(f"python scripts/detect.py --source \"{args.source}\" --roi1 \"{r1_str}\" --roi2 \"{r2_str}\"{light_cmd}")
 
 if __name__ == "__main__":
-    main()
+    main()
