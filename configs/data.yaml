@@ -1,0 +1,5 @@
+train: /kaggle/input/datasets/quannh206/data-private/NHQ/images/train
+val: /kaggle/input/datasets/quannh206/data-private/NHQ/images/val
+
+nc: 3
+names: ["R411", "R412", "R415"]
