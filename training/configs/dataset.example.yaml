@@ -1,0 +1,15 @@
+path: /path/to/data_fisheye
+train: train.txt
+val: val.txt
+test: test.txt
+names:
+  0: "100"
+  1: "120"
+  2: "20"
+  3: "30"
+  4: "40"
+  5: "50"
+  6: "60"
+  7: "70"
+  8: "80"
+  9: "90"
