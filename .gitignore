@@ -23,10 +23,10 @@ data/
 # ==================================
 *.pt
 *.onnx
-models/*
-# NGOAI LE: Cho phep up cac model tot nhat
-!models/yolov11_traffic_light.pt
-!models/yolov11_vehicle.pt
+models/
+# NGOAI LE: Cho phep up cac model tot nhat trong bo suu tap
+!models/best_collection/
+!models/best_collection/*.pt
 
 # Khuyen nghi: Khong up toan bo final_runs len Github vi rat nang.
 # Chi up cac file trong models/best_collection da duoc loc.
