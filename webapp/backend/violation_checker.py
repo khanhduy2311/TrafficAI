@@ -1,7 +1,7 @@
 """
 Violation Checker — Logic phát hiện vi phạm
 Tích hợp logic từ detect_traffic_sign.py và detect_no_helmet.py
-Bao gồm WrongWayChecker (xe đi ngược chiều) tối ưu cho camera fisheye từ trên cao.
+Chừa placeholder cho lane_driving và speed_limit.
 """
 
 import cv2
@@ -21,7 +21,7 @@ class ViolationEvent:
     """Một sự kiện vi phạm."""
     track_id: int
     vehicle_type: str
-    violation_type: str          # "red_light" | "no_helmet" | "wrong_lane" | "wrong_way" | "speed_limit"
+    violation_type: str          # "red_light" | "no_helmet" | "wrong_lane" | "speed_limit"
     confidence: float
     frame_number: int
     bbox: list                   # [x1, y1, x2, y2]
@@ -430,7 +430,7 @@ class NoHelmetChecker:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  3. WRONG LANE VIOLATION CHECKER 
+#  3. WRONG LANE VIOLATION CHECKER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _in_poly(cx, cy, poly):
@@ -441,6 +441,7 @@ def _box_in_poly_ratio(x1, y1, x2, y2, poly, h, w):
     cv2.fillPoly(mask, [np.array(poly, np.int32)], 1)
 
     box_mask = np.zeros((h, w), dtype=np.uint8)
+    # Ràng buộc tọa độ
     y1, y2 = max(0, y1), min(h, y2)
     x1, x2 = max(0, x1), min(w, x2)
     box_mask[y1:y2, x1:x2] = 1
@@ -453,595 +454,24 @@ def _box_in_poly_ratio(x1, y1, x2, y2, poly, h, w):
     return overlap / box_area
 
 
-# ──────────────────────────────────────────────────────────────
-#  SceneFlowEstimator (dùng cho WrongWayChecker)
-#  Tính hướng chính của luồng xe để làm reference
-# ──────────────────────────────────────────────────────────────
-class _SceneFlowEstimator:
-    """
-    Ước tính luồng di chuyển tổng thể của toàn bộ xe trong scene.
-    Camera fisheye từ trên cao → xe di chuyển theo 2D vector (dx, dy).
-    Scene flow = vector trung bình của các xe "đúng chiều" để làm tham chiếu.
-    """
-
-    def __init__(self, window: int = 30):
-        # Lưu list vector (vx, vy) trung bình mỗi frame
-        self._vx_buf: deque = deque(maxlen=window)
-        self._vy_buf: deque = deque(maxlen=window)
-
-    def update(self, vx_list: list, vy_list: list):
-        """Nhận danh sách velocity từng xe trong frame, lấy median."""
-        if len(vx_list) >= 2:
-            self._vx_buf.append(float(np.median(vx_list)))
-            self._vy_buf.append(float(np.median(vy_list)))
-
-    def get_flow_vector(self) -> Optional[tuple]:
-        """Trả về (vx, vy) scene flow hoặc None nếu chưa đủ data."""
-        if len(self._vx_buf) < 5:
-            return None
-        return float(np.mean(self._vx_buf)), float(np.mean(self._vy_buf))
-
-    def cosine_similarity(self, vx: float, vy: float) -> Optional[float]:
-        """
-        Tính cosine similarity giữa vector xe và scene flow.
-        = 1.0  → cùng hướng hoàn toàn
-        = 0.0  → vuông góc
-        = -1.0 → ngược chiều hoàn toàn
-        """
-        flow = self.get_flow_vector()
-        if flow is None:
-            return None
-        fx, fy = flow
-        mag_v    = (vx**2 + vy**2) ** 0.5
-        mag_flow = (fx**2 + fy**2) ** 0.5
-        if mag_v < 1e-6 or mag_flow < 1e-6:
-            return None
-        return (vx * fx + vy * fy) / (mag_v * mag_flow)
-
-    def reset(self):
-        self._vx_buf.clear()
-        self._vy_buf.clear()
-
-
-# ──────────────────────────────────────────────────────────────
-#  TrackMotion — lưu lịch sử vị trí & tính vector vận tốc 2D
-# ──────────────────────────────────────────────────────────────
-class _TrackMotion:
-    """
-    Lưu lịch sử tâm bbox theo frame.
-    Tính vector vận tốc 2D (vx, vy) trung bình trong cửa sổ gần nhất.
-    Dùng cho camera top-down / fisheye: cả dx và dy đều có ý nghĩa.
-    """
-
-    def __init__(self, history_len: int = 20):
-        self._history: deque = deque(maxlen=history_len)  # (frame_idx, cx, cy)
-
-    def update(self, frame_idx: int, cx: float, cy: float):
-        self._history.append((frame_idx, cx, cy))
-
-    def get_velocity(self, min_frames: int = 4) -> Optional[tuple]:
-        """
-        Trả về (vx, vy) pixel/frame trung bình.
-        None nếu chưa đủ frame hoặc không di chuyển.
-        """
-        if len(self._history) < min_frames:
-            return None
-        pts = list(self._history)
-        vx_list, vy_list = [], []
-        for i in range(1, len(pts)):
-            df = pts[i][0] - pts[i-1][0]
-            if df <= 0:
-                continue
-            vx_list.append((pts[i][1] - pts[i-1][1]) / df)
-            vy_list.append((pts[i][2] - pts[i-1][2]) / df)
-        if not vx_list:
-            return None
-        return float(np.mean(vx_list)), float(np.mean(vy_list))
-
-    def get_displacement(self) -> float:
-        """Khoảng cách pixel từ điểm đầu đến điểm cuối."""
-        if len(self._history) < 2:
-            return 0.0
-        import math
-        p0, p1 = self._history[0], self._history[-1]
-        return math.hypot(p1[1] - p0[1], p1[2] - p0[2])
-
-    def speed_norm(self) -> float:
-        """Tốc độ chuẩn hóa (pixel/frame)."""
-        vel = self.get_velocity()
-        if vel is None:
-            return 0.0
-        return (vel[0]**2 + vel[1]**2) ** 0.5
-
-    def reset(self):
-        self._history.clear()
-
-
-# ──────────────────────────────────────────────────────────────
-#  WrongWayChecker — phát hiện xe đi ngược chiều
-#  Tối ưu cho camera fisheye từ trên cao (bird's-eye / top-down)
-# ──────────────────────────────────────────────────────────────
-class WrongWayChecker:
-    """
-    Phát hiện xe đi ngược chiều dựa trên HƯỚNG DI CHUYỂN 2D (vx, vy).
-
-    Nguyên lý (top-down fisheye camera):
-    ─────────────────────────────────────────────────────────────
-    1. Mỗi xe có một track lịch sử tâm bbox → tính velocity vector (vx, vy).
-    2. SceneFlowEstimator tính vector trung bình của TẤT CẢ xe đang chạy
-       → đây là hướng "đúng chiều" tham chiếu.
-    3. Cosine similarity giữa vector xe và scene flow:
-         cos > threshold  → đúng chiều
-         cos < -threshold → NGƯỢC CHIỀU → vi phạm
-    4. Confirmation: phải có N frame liên tiếp cos âm mới bắt vi phạm
-       (chống false positive khi xe rẽ / dừng / đổi hướng tạm thời).
-    5. ROI: chỉ kiểm tra xe nằm trong vùng đường 1 chiều đã định nghĩa.
-
-    Ưu điểm so với thuật toán cũ (chỉ dùng dy):
-    ─────────────────────────────────────────────────────────────
-    - Dùng vector 2D → hoạt động đúng với camera trên cao
-    - Scene flow adaptive → tự học hướng đúng từ traffic thực tế
-    - Không bị ảnh hưởng bởi góc nghiêng camera
-    - Confirmation frames → ít false positive
-    - Hỗ trợ nhiều vùng đường (multi-ROI) với từng hướng riêng
-    """
-
-    # Cấu hình mặc định
-    DEFAULT_CFG = {
-        # Ngưỡng cosine similarity: cos < -threshold → ngược chiều
-        # Range: 0.0 (vuông góc) → 1.0 (đối diện hoàn toàn)
-        # Khuyến nghị: 0.3 cho đường thẳng, 0.5 cho ngã tư
-        'cosine_wrong_way_thresh': 0.30,
-
-        # Số frame liên tiếp phải cos âm mới confirm vi phạm
-        'confirm_frames': 5,
-
-        # Giảm counter mỗi frame không vi phạm (hysteresis)
-        'confirm_decay': 1,
-
-        # Số frame tối thiểu để tính velocity
-        'min_frames_to_judge': 5,
-
-        # Tốc độ pixel/frame tối thiểu để xét (lọc xe đứng yên)
-        'min_speed_px_per_frame': 1.5,
-
-        # Khoảng cách dịch chuyển tối thiểu (pixel) trong toàn bộ history
-        'min_displacement_px': 12,
-
-        # Scene flow window (số frame tích lũy)
-        'scene_flow_window': 30,
-
-        # Tỉ lệ diện tích bbox tối đa so với frame (lọc bbox quá to)
-        'max_bbox_area_pct': 0.60,
-
-        # Cooldown frames giữa 2 lần bắt cùng 1 xe
-        'cooldown_frames': 90,
-
-        # Override per class (giảm ngưỡng cho Bike/Pedestrian)
-        'class_overrides': {
-            'Bike': {
-                'min_speed_px_per_frame': 1.0,
-                'min_displacement_px': 8,
-                'confirm_frames': 4,
-                'min_frames_to_judge': 4,
-            },
-            'Pedestrian': {
-                'min_speed_px_per_frame': 0.8,
-                'min_displacement_px': 6,
-                'confirm_frames': 4,
-                'min_frames_to_judge': 4,
-                'cosine_wrong_way_thresh': 0.25,
-            },
-        },
-
-        # Merge Bike ↔ Pedestrian track (giảm ID switch)
-        'merge_bike_pedestrian': True,
-
-        # Hiển thị vector debug lên frame
-        'show_velocity_arrow': True,
-    }
-
-    def __init__(self, cfg: Optional[dict] = None):
-        self.cfg = {**self.DEFAULT_CFG, **(cfg or {})}
-
-        # Scene flow (adaptive hướng đúng chiều)
-        self._scene_flow = _SceneFlowEstimator(
-            window=self.cfg['scene_flow_window']
-        )
-
-        # Per-track state
-        self._tracks: dict[int, dict] = {}
-        # track_id → {
-        #   'motion': _TrackMotion,
-        #   'class_name': str,
-        #   'consec_wrong': int,
-        #   'confirmed': bool,
-        #   'viol_frame': int | None,
-        #   'last_cos': float | None,
-        # }
-
-        # Confirmed violators
-        self.violated_ids: set = set()
-        self._cooldown: dict = {}       # track_id → last_viol_frame
-
-        # ROI zones: list of polygon pts (pixel)
-        # Nếu rỗng → kiểm tra toàn frame
-        self._roi_zones: list = []      # list of np.ndarray polygon
-
-        # Mapping class alias (Bike ↔ Pedestrian merge)
-        self._id_alias: dict = {}       # new_id → canonical_id
-
-    # ── Public API ──────────────────────────────────────────
-
-    def set_roi_zones(self, zones: list):
-        """
-        Định nghĩa các vùng đường cần kiểm tra ngược chiều.
-        zones: list of polygon [(x,y), ...] pixel tuyệt đối.
-        """
-        self._roi_zones = [np.array(z, np.int32) for z in zones]
-
-    def set_roi_from_frame_size(self, width: int, height: int):
-        """
-        Tự động tạo ROI mặc định: toàn bộ phần giữa frame
-        (phù hợp với đường 1 chiều điển hình nhìn từ trên).
-        Bạn nên override bằng set_roi_zones() với polygon thực tế.
-        """
-        self._roi_zones = [np.array([
-            [int(width * 0.1), int(height * 0.1)],
-            [int(width * 0.9), int(height * 0.1)],
-            [int(width * 0.9), int(height * 0.9)],
-            [int(width * 0.1), int(height * 0.9)],
-        ], np.int32)]
-
-    def check(
-        self,
-        vehicle_boxes,
-        vehicle_track_ids,
-        vehicle_classes,
-        vehicle_confs,
-        vehicle_model,
-        frame_number: int,
-        original_frame: np.ndarray,
-    ) -> list[ViolationEvent]:
-        """
-        Kiểm tra xe đi ngược chiều trong frame hiện tại.
-        Trả về list ViolationEvent mới phát hiện.
-        """
-        h, w = original_frame.shape[:2]
-        frame_area = h * w
-        violations = []
-
-        # ── Bước 1: Update track history ──────────────────
-        vx_scene, vy_scene = [], []
-
-        for box, track_id, cls_id, conf in zip(
-            vehicle_boxes, vehicle_track_ids, vehicle_classes, vehicle_confs
-        ):
-            x1, y1, x2, y2 = map(int, box)
-            track_id = int(track_id)
-            cls_name = vehicle_model.names[int(cls_id)]
-
-            # Lọc bbox quá lớn (noise)
-            if (x2-x1) * (y2-y1) / frame_area > self.cfg['max_bbox_area_pct']:
-                continue
-
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-
-            # Kiểm tra ROI
-            if self._roi_zones and not self._in_any_roi(cx, cy):
-                continue
-
-            # Merge Bike/Pedestrian track alias
-            canonical_id = self._resolve_id(track_id, cls_name)
-
-            # Lấy hoặc tạo track state
-            state = self._get_or_create(canonical_id, cls_name)
-            state['motion'].update(frame_number, cx, cy)
-            state['class_name'] = cls_name  # cập nhật class mới nhất
-
-            # Đóng góp vào scene flow nếu xe đang di chuyển
-            vel = state['motion'].get_velocity(
-                min_frames=state['cfg']['min_frames_to_judge']
-            )
-            if vel is not None:
-                spd = (vel[0]**2 + vel[1]**2) ** 0.5
-                if spd >= state['cfg']['min_speed_px_per_frame']:
-                    vx_scene.append(vel[0])
-                    vy_scene.append(vel[1])
-
-        # Cập nhật scene flow từ tất cả xe frame này
-        self._scene_flow.update(vx_scene, vy_scene)
-
-        # ── Bước 2: Evaluate từng xe ──────────────────────
-        for box, track_id, cls_id, conf in zip(
-            vehicle_boxes, vehicle_track_ids, vehicle_classes, vehicle_confs
-        ):
-            x1, y1, x2, y2 = map(int, box)
-            track_id = int(track_id)
-            cls_name = vehicle_model.names[int(cls_id)]
-
-            if (x2-x1) * (y2-y1) / frame_area > self.cfg['max_bbox_area_pct']:
-                continue
-
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-
-            if self._roi_zones and not self._in_any_roi(cx, cy):
-                continue
-
-            canonical_id = self._resolve_id(track_id, cls_name)
-            if canonical_id not in self._tracks:
-                continue
-
-            state = self._tracks[canonical_id]
-            c = state['cfg']
-
-            vel = state['motion'].get_velocity(min_frames=c['min_frames_to_judge'])
-            disp = state['motion'].get_displacement()
-            spd = state['motion'].speed_norm()
-
-            is_wrong = False
-            cos_val = None
-
-            if (
-                vel is not None
-                and spd >= c['min_speed_px_per_frame']
-                and disp >= c['min_displacement_px']
-            ):
-                cos_val = self._scene_flow.cosine_similarity(vel[0], vel[1])
-                if cos_val is not None:
-                    # cos âm và đủ lớn → ngược chiều
-                    if cos_val < -c['cosine_wrong_way_thresh']:
-                        is_wrong = True
-
-            state['last_cos'] = cos_val
-
-            # Confirmation logic (hysteresis)
-            if is_wrong:
-                state['consec_wrong'] += 1
-            else:
-                state['consec_wrong'] = max(0, state['consec_wrong'] - c.get('confirm_decay', 1))
-
-            # Confirm vi phạm
-            if (
-                not state['confirmed']
-                and state['consec_wrong'] >= c['confirm_frames']
-            ):
-                # Kiểm tra cooldown
-                last_vio = self._cooldown.get(canonical_id, -99999)
-                if frame_number - last_vio >= self.cfg['cooldown_frames']:
-                    state['confirmed'] = True
-                    state['viol_frame'] = frame_number
-                    self._cooldown[canonical_id] = frame_number
-                    self.violated_ids.add(canonical_id)
-
-                    evidence_path = self._save_evidence(
-                        original_frame, x1, y1, x2, y2,
-                        canonical_id, frame_number, cos_val
-                    )
-                    violations.append(ViolationEvent(
-                        track_id=canonical_id,
-                        vehicle_type=cls_name,
-                        violation_type="wrong_way",
-                        confidence=float(conf),
-                        frame_number=frame_number,
-                        bbox=[x1, y1, x2, y2],
-                        evidence_path=evidence_path,
-                    ))
-
-            # Nếu đã confirm nhưng xe đã quay đầu → reset confirm
-            # (để bắt lại nếu quay đầu tiếp)
-            if state['confirmed'] and state['consec_wrong'] == 0:
-                state['confirmed'] = False
-
-        return violations
-
-    def is_wrong_way(self, track_id: int) -> bool:
-        """Kiểm tra nhanh track_id có đang bị đánh dấu ngược chiều không."""
-        canonical = self._id_alias.get(track_id, track_id)
-        return canonical in self.violated_ids
-
-    def get_debug_info(self, track_id: int) -> str:
-        """Trả về string debug cho track."""
-        canonical = self._id_alias.get(track_id, track_id)
-        state = self._tracks.get(canonical)
-        if state is None:
-            return "no state"
-        cos = state['last_cos']
-        cos_s = f"{cos:+.3f}" if cos is not None else "N/A"
-        flow = self._scene_flow.get_flow_vector()
-        flow_s = f"({flow[0]:+.2f},{flow[1]:+.2f})" if flow else "warming"
-        vel = state['motion'].get_velocity()
-        vel_s = f"({vel[0]:+.2f},{vel[1]:+.2f})" if vel else "N/A"
-        return (
-            f"cos={cos_s} consec={state['consec_wrong']} "
-            f"vel={vel_s} flow={flow_s}"
-        )
-
-    def draw_zones(self, frame: np.ndarray):
-        """Vẽ các vùng ROI wrong-way lên frame."""
-        for zone in self._roi_zones:
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [zone], (0, 80, 200))
-            cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
-            cv2.polylines(frame, [zone], isClosed=True,
-                          color=(0, 140, 255), thickness=2, lineType=cv2.LINE_AA)
-
-            # Label ở tâm
-            cx = int(zone[:, 0].mean())
-            cy = int(zone[:, 1].mean())
-            # Vẽ mũi tên hướng flow (nếu có)
-            flow = self._scene_flow.get_flow_vector()
-            if flow is not None:
-                fx, fy = flow
-                mag = (fx**2 + fy**2) ** 0.5
-                if mag > 0:
-                    scale = 40 / mag
-                    ex, ey = int(cx + fx * scale), int(cy + fy * scale)
-                    cv2.arrowedLine(frame, (cx, cy), (ex, ey),
-                                    (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.3)
-
-            cv2.putText(frame, "WAY ZONE", (cx - 60, cy + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
-
-    def draw_velocity_arrows(self, frame: np.ndarray,
-                              vehicle_boxes, vehicle_track_ids,
-                              vehicle_classes, vehicle_model):
-        """
-        Vẽ mũi tên velocity lên từng xe trong frame.
-        Màu: xanh lá = đúng chiều, đỏ = ngược chiều, vàng = chưa xác định.
-        """
-        if not self.cfg.get('show_velocity_arrow', True):
-            return
-
-        for box, track_id, cls_id in zip(
-            vehicle_boxes, vehicle_track_ids, vehicle_classes
-        ):
-            track_id = int(track_id)
-            canonical = self._id_alias.get(track_id, track_id)
-            state = self._tracks.get(canonical)
-            if state is None:
-                continue
-
-            vel = state['motion'].get_velocity()
-            if vel is None:
-                continue
-
-            x1, y1, x2, y2 = map(int, box)
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-
-            vx, vy = vel
-            mag = (vx**2 + vy**2) ** 0.5
-            if mag < 0.5:
-                continue
-
-            scale = 25.0 / mag
-            ex, ey = int(cx + vx * scale), int(cy + vy * scale)
-
-            cos_val = state['last_cos']
-            c = state['cfg']
-            if cos_val is None:
-                color = (200, 200, 0)
-            elif cos_val < -c['cosine_wrong_way_thresh']:
-                color = (0, 0, 255)   # Đỏ = ngược chiều
-            else:
-                color = (0, 220, 60)  # Xanh = đúng chiều
-
-            cv2.arrowedLine(frame, (cx, cy), (ex, ey),
-                            color, 2, cv2.LINE_AA, tipLength=0.35)
-
-    def reset(self):
-        self._tracks.clear()
-        self._scene_flow.reset()
-        self.violated_ids.clear()
-        self._cooldown.clear()
-        self._id_alias.clear()
-
-    # ── Private helpers ─────────────────────────────────────
-
-    def _in_any_roi(self, cx: float, cy: float) -> bool:
-        for zone in self._roi_zones:
-            if cv2.pointPolygonTest(zone, (float(cx), float(cy)), False) >= 0:
-                return True
-        return False
-
-    def _resolve_id(self, track_id: int, cls_name: str) -> int:
-        """
-        Nếu merge_bike_pedestrian=True và track mới là Bike/Pedestrian
-        có một track cũ gần đó thuộc class đối diện → dùng id cũ.
-        """
-        if not self.cfg.get('merge_bike_pedestrian', True):
-            return track_id
-        if cls_name not in ('Bike', 'Pedestrian'):
-            return track_id
-        if track_id in self._id_alias:
-            return self._id_alias[track_id]
-        # Nếu track_id đã có state → giữ nguyên
-        if track_id in self._tracks:
-            return track_id
-        return track_id
-
-    def _get_or_create(self, track_id: int, cls_name: str) -> dict:
-        if track_id not in self._tracks:
-            c = self.cfg.get('class_overrides', {}).get(cls_name, {})
-            merged_cfg = {**self.cfg, **c}
-            self._tracks[track_id] = {
-                'motion':       _TrackMotion(history_len=self.cfg.get('track_history_len', 20)),
-                'class_name':   cls_name,
-                'cfg':          merged_cfg,
-                'consec_wrong': 0,
-                'confirmed':    False,
-                'viol_frame':   None,
-                'last_cos':     None,
-            }
-        return self._tracks[track_id]
-
-    def _save_evidence(
-        self, frame, x1, y1, x2, y2,
-        track_id, frame_number, cos_val
-    ) -> str:
-        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-        h, w = frame.shape[:2]
-        pad = 25
-        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
-        cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
-        crop = frame[cy1:cy2, cx1:cx2].copy()
-
-        # Overlay thông tin lên ảnh bằng chứng
-        cos_s = f"{cos_val:+.3f}" if cos_val is not None else "N/A"
-        cv2.putText(crop, f"ID:{track_id} WRONG WAY",
-                    (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-        cv2.putText(crop, f"cos={cos_s}",
-                    (5, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 200, 255), 1)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"wrongway_id{track_id}_f{frame_number}_{ts}.jpg"
-        cv2.imwrite(str(EVIDENCE_DIR / filename), crop)
-        return filename
-
-
 class WrongLaneChecker:
-    """
-    Phát hiện xe chạy sai làn đường tại ngã tư (dựa trên Polygon định sẵn & Tracking).
-    Tích hợp WrongWayChecker (đi ngược chiều) vào cùng nhóm.
-    """
+    """Phát hiện xe chạy sai làn đường dựa trên Polygon định sẵn & Tracking."""
 
     def __init__(self):
-        # ── Lane & exit polygons ──
-        self.lane_left  = [(19, 553), (51, 523), (243, 585), (93, 689), (48, 614)]
-        self.lane_mid   = [(100, 694), (314, 541), (666, 541), (644, 651), (595, 784), (370, 783), (203, 783)]
+        self.lane_left = [(19, 553), (51, 523), (243, 585), (93, 689), (48, 614)]
+        self.lane_mid = [(100, 694), (314, 541), (666, 541), (644, 651), (595, 784), (370, 783), (203, 783)]
         self.lane_right = [(606, 785), (669, 546), (813, 522), (792, 635), (699, 748)]
 
-        self.exit_right    = [(647, 383), (759, 509), (841, 491), (843, 451), (737, 386)]
-        self.exit_left     = [(79, 497), (161, 352), (71, 353), (19, 467), (54, 462)]
+        self.exit_right = [(647, 383), (759, 509), (841, 491), (843, 451), (737, 386)]
+        self.exit_left = [(79, 497), (161, 352), (71, 353), (19, 467), (54, 462)]
         self.exit_straight = [(163, 338), (179, 363), (345, 355), (265, 325), (170, 336)]
 
-        # ── Wrong lane state ──
-        self.lane_map:     dict = {}
-        self.direction_map: dict = {}
-        self.valid_ids:    set = set()
-        self.violated_ids: set = set()
-        self.last_positions: dict = {}
-        self.sign_detected: bool = False
-
-        # ── Wrong Way Checker (tích hợp) ──
-        self.wrong_way_checker = WrongWayChecker()
-
-    # ── Setter ROI cho WrongWayChecker ──────────────────────
-
-    def set_wrong_way_roi(self, zones: list):
-        """
-        Định nghĩa vùng cần kiểm tra ngược chiều.
-        zones: list of polygon [(x,y), ...]
-        """
-        self.wrong_way_checker.set_roi_zones(zones)
-
-    def set_wrong_way_roi_from_frame(self, width: int, height: int):
-        """Tự động tạo ROI wrong-way từ kích thước frame."""
-        self.wrong_way_checker.set_roi_from_frame_size(width, height)
-
-    # ── Main check (gộp wrong_lane + wrong_way) ─────────────
+        self.lane_map = {}
+        self.direction_map = {}
+        self.valid_ids = set()
+        self.violated_ids = set()
+        self.last_positions = {}
+        self.sign_detected = False
 
     def check(
         self,
@@ -1054,38 +484,6 @@ class WrongLaneChecker:
         frame_number: int,
         original_frame: np.ndarray,
     ) -> list[ViolationEvent]:
-        violations = []
-
-        # ── A. Kiểm tra sai làn tại ngã tư ─────────────────
-        wrong_lane_viols = self._check_wrong_lane(
-            lane_results, vehicle_boxes, vehicle_track_ids,
-            vehicle_classes, vehicle_confs, vehicle_model,
-            frame_number, original_frame,
-        )
-        violations.extend(wrong_lane_viols)
-
-        # ── B. Kiểm tra xe đi ngược chiều ───────────────────
-        wrong_way_viols = self.wrong_way_checker.check(
-            vehicle_boxes, vehicle_track_ids,
-            vehicle_classes, vehicle_confs,
-            vehicle_model, frame_number, original_frame,
-        )
-        violations.extend(wrong_way_viols)
-
-        return violations
-
-    def _check_wrong_lane(
-        self,
-        lane_results,
-        vehicle_boxes,
-        vehicle_track_ids,
-        vehicle_classes,
-        vehicle_confs,
-        vehicle_model,
-        frame_number: int,
-        original_frame: np.ndarray,
-    ) -> list[ViolationEvent]:
-        """Logic gốc: phát hiện sai làn tại ngã tư."""
         violations = []
 
         if lane_results is not None and len(lane_results.boxes) > 0:
@@ -1108,7 +506,7 @@ class WrongLaneChecker:
             if cls_name == "pedestrian":
                 continue
 
-            # RECONNECT logic (giống code gốc)
+            # ===== RECONNECT (fix + cùng loại xe) =====
             if track_id not in self.last_positions:
                 for old_id, (old_cx, old_cy, old_frame, old_box, old_cls) in list(self.last_positions.items()):
                     if old_id not in current_frame_ids:
@@ -1129,15 +527,17 @@ class WrongLaneChecker:
                         ):
                             if old_id in self.valid_ids:
                                 self.valid_ids.add(track_id)
+                            # Transfer lane_map so violation can be caught if ID changes in intersection
                             if old_id in self.lane_map:
                                 self.lane_map[track_id] = self.lane_map[old_id]
                             break
 
             self.last_positions[track_id] = (cx, cy, frame_number, (x1, y1, x2, y2), cls_name)
 
+            # Kiểm tra xe có nằm trong khu vực hợp lệ (làn đường ban đầu)
             if track_id not in self.valid_ids:
-                r_left  = _box_in_poly_ratio(x1, y1, x2, y2, self.lane_left, h, w)
-                r_mid   = _box_in_poly_ratio(x1, y1, x2, y2, self.lane_mid, h, w)
+                r_left = _box_in_poly_ratio(x1, y1, x2, y2, self.lane_left, h, w)
+                r_mid = _box_in_poly_ratio(x1, y1, x2, y2, self.lane_mid, h, w)
                 r_right = _box_in_poly_ratio(x1, y1, x2, y2, self.lane_right, h, w)
 
                 if max(r_left, r_mid, r_right) > 0.5:
@@ -1146,16 +546,18 @@ class WrongLaneChecker:
             if track_id not in self.valid_ids:
                 continue
 
+            # Lưu lại origin lane
             if track_id not in self.lane_map:
                 ratios = {
-                    "left":     _box_in_poly_ratio(x1, y1, x2, y2, self.lane_left, h, w),
+                    "left": _box_in_poly_ratio(x1, y1, x2, y2, self.lane_left, h, w),
                     "straight": _box_in_poly_ratio(x1, y1, x2, y2, self.lane_mid, h, w),
-                    "right":    _box_in_poly_ratio(x1, y1, x2, y2, self.lane_right, h, w),
+                    "right": _box_in_poly_ratio(x1, y1, x2, y2, self.lane_right, h, w)
                 }
                 best_lane = max(ratios, key=ratios.get)
                 if ratios[best_lane] > 0.5:
                     self.lane_map[track_id] = best_lane
 
+            # Xét hướng đi vào exit rules
             if _in_poly(cx, cy, self.exit_straight):
                 self.direction_map[track_id] = "straight"
             elif _in_poly(cx, cy, self.exit_left):
@@ -1163,15 +565,17 @@ class WrongLaneChecker:
             elif _in_poly(cx, cy, self.exit_right):
                 self.direction_map[track_id] = "right"
 
+            # Check vi phạm
             if track_id in self.lane_map and track_id in self.direction_map:
                 if self.lane_map[track_id] != self.direction_map[track_id]:
                     if track_id not in self.violated_ids:
                         self.violated_ids.add(track_id)
-
+                        
+                        # Lưu ảnh bằng chứng
                         evidence_path = self._save_evidence(
                             original_frame, x1, y1, x2, y2, track_id, frame_number
                         )
-
+                        
                         violations.append(ViolationEvent(
                             track_id=track_id,
                             vehicle_type=vehicle_model.names[int(cls_id)],
@@ -1205,60 +609,77 @@ class WrongLaneChecker:
         self.violated_ids.clear()
         self.last_positions.clear()
         self.sign_detected = False
-        self.wrong_way_checker.reset()
 
     def draw_zones(self, frame: np.ndarray):
-        """Vẽ origin lanes + exit zones + wrong-way zones."""
-        # ── Wrong lane zones (ngã tư) ──
-        if self.sign_detected:
-            _draw_lane_zone(frame, self.lane_left,    (255, 180,  60), "<- LEFT",    alpha=0.18)
-            _draw_lane_zone(frame, self.lane_mid,     ( 60, 220,  60), "^ STRAIGHT", alpha=0.18)
-            _draw_lane_zone(frame, self.lane_right,   ( 60, 160, 255), "-> RIGHT",   alpha=0.18)
+        """Vẽ origin lanes + exit zones đẹp hơn với tâm label và hướng rõ ràng."""
+        if not self.sign_detected:
+            return
 
-            _draw_lane_zone(frame, self.exit_left,     (200, 120,  20), "EXIT <-", alpha=0.15, border_color=(255,200,100))
-            _draw_lane_zone(frame, self.exit_straight, ( 20, 160,  20), "EXIT ^",  alpha=0.15, border_color=(120,255,120))
-            _draw_lane_zone(frame, self.exit_right,    ( 20, 100, 200), "EXIT ->", alpha=0.15, border_color=(120,180,255))
+        # ---- Origin zones (nơi xe xuất phát) ----
+        _draw_lane_zone(frame, self.lane_left,    (255, 180,  60), "<- LEFT",     alpha=0.18)
+        _draw_lane_zone(frame, self.lane_mid,     ( 60, 220,  60), "^ STRAIGHT",  alpha=0.18)
+        _draw_lane_zone(frame, self.lane_right,   ( 60, 160, 255), "-> RIGHT",    alpha=0.18)
 
-        # ── Wrong way zones ──
-        self.wrong_way_checker.draw_zones(frame)
+        # ---- Exit zones (hướng đầu xe đi ra) ----
+        _draw_lane_zone(frame, self.exit_left,     (200, 120,  20), "EXIT <-",  alpha=0.15, border_color=(255,200,100))
+        _draw_lane_zone(frame, self.exit_straight, ( 20, 160,  20), "EXIT ^",   alpha=0.15, border_color=(120,255,120))
+        _draw_lane_zone(frame, self.exit_right,    ( 20, 100, 200), "EXIT ->",  alpha=0.15, border_color=(120,180,255))
 
-    # Expose wrong_way violated_ids cho pipeline annotate
-    @property
-    def wrong_way_violated_ids(self) -> set:
-        return self.wrong_way_checker.violated_ids
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  4. PERSPECTIVE SPEED ESTIMATOR
+#     Dùng bbox height làm proxy khoảng cách + perspective projection
+#     Chính xác hơn cho camera giao thông thực tế (không cần fisheye model)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import math as _math
 import re as _re
 
-_SPEED_MEDIAN_WINDOW        = 15
-_SPEED_STABLE_FRAMES        = 7
+# ── Hằng số tốc độ ──────────────────────────────────────────────────────────
+_SPEED_MEDIAN_WINDOW        = 15       # Cửa sổ median rộng hơn → ổn định hơn
+_SPEED_STABLE_FRAMES        = 7        # Yêu cầu nhiều frame ổn định hơn
 _SPEED_STABLE_TOLERANCE_KMH = 4.0
-_MAX_PHYSICAL_KMH           = 120.0
-_MAX_FRAME_GAP              = 4
+_MAX_PHYSICAL_KMH           = 120.0   # Cap thực tế cho đường đô thị
+_MAX_FRAME_GAP              = 4        # Nghiêm ngặt hơn để tránh jump lớn
 _UNLOCK_DELTA_KMH           = 6.0
-_WARMUP_FRAMES              = 10
+_WARMUP_FRAMES              = 10       # Warmup dài hơn để tích lũy đủ history
 _VALID_SPEED_LIMITS         = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
 _MIN_SPEED_TO_CHECK         = 5
 _VIOLATION_THRESHOLD        = 1.0
 _COOLDOWN_FRAMES            = 90
 _VALID_RADIUS_RATIO         = 1.0
-
+# ── Tham số calibration perspective ─────────────────────────────────────────
+# Chiều cao camera thực tế so với mặt đường (mét)
 _CAMERA_HEIGHT_M            = 6.0
+# Tiêu cự ảo (focal_length / sensor_pixel_size) — chỉnh theo camera thực tế.
+# Giá trị này ảnh hưởng trực tiếp scale tốc độ. Tăng lên → tốc độ nhỏ lại.
 _FOCAL_LENGTH_PX            = 400.0
+# Chiều cao xe thực tế trung bình (mét) — dùng để xác nhận scale
 _AVG_VEHICLE_HEIGHT_M       = 1.5
+# Tỉ lệ bbox height / frame height để coi xe "đang ở gần" (vùng dưới màn hình)
 _NEAR_ZONE_RATIO            = 0.25
+# Tỉ lệ bbox height / frame height để coi xe "đang ở xa" (vùng trên màn hình)
 _FAR_ZONE_RATIO             = 0.05
-_GLOBAL_SPEED_SCALE         = 0.8
+# Scale factor toàn cục: tăng → tốc độ nhanh hơn, giảm → chậm hơn
+# Mỗi +0.05 ≈ +5 km/h ở tốc độ đô thị ~30 km/h
+_GLOBAL_SPEED_SCALE         = 0.8    # Tăng từ 0.55 → thêm ~5 km/h
 
 
 class PerspectiveSpeedEstimator:
     """
     Ước tính tốc độ dựa trên Perspective Projection (Pinhole Camera Model).
+
+    Nguyên lý:
+    - Bbox height (pixel) của xe tỉ lệ nghịch với khoảng cách thực tế đến camera.
+    - Khi xe di chuyển Δpx pixel trên màn hình, khoảng cách thực tương ứng
+      được tính từ tỉ lệ: ground_dist = Δpx * depth / focal_length_px
+    - depth ≈ camera_height / sin(elevation_angle) ≈ camera_height * f / bbox_h * scale
+
+    Ưu điểm so với fisheye model cũ:
+    - Không giả định camera overhead 185° FOV (sai với camera giao thông)
+    - Xe ở giữa xa/nhỏ → bbox_h nhỏ → depth lớn → Δpx nhỏ → tốc độ thấp đúng thực tế
+    - Xe gần/lớn → bbox_h lớn → depth nhỏ → Δpx lớn → tính đúng tốc độ cao
     """
 
     def __init__(self, frame_w: int, frame_h: int, fps: float):
@@ -1267,18 +688,24 @@ class PerspectiveSpeedEstimator:
         self.frame_h   = frame_h
         self._tracks: dict = {}
 
+    # ── Public API ──────────────────────────────────────────────────────────
     def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int) -> int:
+        """
+        Trả về tốc độ (km/h) >= 0.
+        Trả 0 khi warmup hoặc không đủ dữ liệu.
+        """
         x1, y1, x2, y2 = bbox
-        cx_px = (x1 + x2) / 2.0
-        cy_px = (y1 + y2) / 2.0
-        bh_px = float(y2 - y1)
+        cx_px  = (x1 + x2) / 2.0   # Tâm ngang bbox
+        cy_px  = (y1 + y2) / 2.0   # Tâm dọc bbox
+        bh_px  = float(y2 - y1)    # Chiều cao bbox (pixel) — proxy khoảng cách
 
+        # Bỏ qua bbox quá nhỏ (quá xa, không đủ tin cậy)
         if bh_px < 8:
             return 0
 
         if track_id not in self._tracks:
             self._tracks[track_id] = {
-                "history":      deque(maxlen=12),
+                "history":      deque(maxlen=12),  # (cx, cy, bh, frame_idx)
                 "speeds":       deque(maxlen=_SPEED_MEDIAN_WINDOW),
                 "stable_count": 0,
                 "locked_speed": None,
@@ -1295,18 +722,31 @@ class PerspectiveSpeedEstimator:
             frame_gap = frame_idx - prev_idx
 
             if frame_gap > _MAX_FRAME_GAP:
+                # Xe bị miss quá nhiều frame → reset
                 self._reset_track(track, cx_px, cy_px, bh_px, frame_idx)
                 return 0
 
             dt = frame_gap / self.fps if self.fps > 0 else 0.0
             if dt > 0:
-                avg_bh  = (bh_px + prev_bh) / 2.0
+                # Dùng bbox height trung bình của 2 frame để ước tính depth
+                avg_bh = (bh_px + prev_bh) / 2.0
+
+                # Khoảng cách thực tế ~ camera_height_m * focal_length_px / bbox_height_px
+                # (từ similar triangles: object_size/distance = image_size/focal_length)
                 depth_m = (_CAMERA_HEIGHT_M * _FOCAL_LENGTH_PX) / max(avg_bh, 1.0)
-                dpx     = _math.hypot(cx_px - prev_cx, cy_px - prev_cy)
-                dist_m  = dpx * depth_m / _FOCAL_LENGTH_PX
+
+                # Di chuyển pixel trong không gian ảnh
+                dpx = _math.hypot(cx_px - prev_cx, cy_px - prev_cy)
+
+                # Quy đổi sang mét thực: dist_m = dpx * depth_m / focal_length
+                dist_m = dpx * depth_m / _FOCAL_LENGTH_PX
+
+                # Áp dụng scale toàn cục để bù sai số model
                 dist_m *= _GLOBAL_SPEED_SCALE
+
                 inst_kmh = (dist_m / dt) * 3.6
 
+                # Clamp tốc độ vật lý
                 if inst_kmh > _MAX_PHYSICAL_KMH:
                     inst_kmh = track["speeds"][-1] if track["speeds"] else 0.0
 
@@ -1316,8 +756,11 @@ class PerspectiveSpeedEstimator:
                     return 0
 
                 track["speeds"].append(inst_kmh)
+
+                # Median filter → chống outlier
                 median_speed = float(np.median(track["speeds"]))
 
+                # EMA smoothing
                 if track["ema_speed"] == 0.0:
                     track["ema_speed"] = median_speed
                 else:
@@ -1339,6 +782,7 @@ class PerspectiveSpeedEstimator:
     def reset(self):
         self._tracks.clear()
 
+    # ── Private helpers ──────────────────────────────────────────────────────
     def _reset_track(self, track, cx, cy, bh, frame_idx):
         track["history"].clear()
         track["speeds"].clear()
@@ -1368,27 +812,39 @@ class PerspectiveSpeedEstimator:
             track["locked_speed"] = smoothed
 
 
-# Alias backward-compat
+# Alias backward-compat cho code cũ vẫn dùng tên FisheyeSpeedEstimator
 FisheyeSpeedEstimator = PerspectiveSpeedEstimator
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  5. SPEED LIMIT VIOLATION CHECKER
+#     Dùng FisheyeSpeedEstimator + model detect biển báo tốc độ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SpeedLimitChecker:
-    """Phát hiện xe vượt quá tốc độ cho phép."""
+    """
+    Phát hiện xe vượt quá tốc độ cho phép.
+
+    - Chỉ bắt vi phạm sau khi model detect được biển báo tốc độ (sign_detected).
+    - Tính tốc độ bằng FisheyeSpeedEstimator (EMA + lock speed + distortion).
+    - Cooldown 90 frame / xe để tránh lưu bằng chứng trùng lặp.
+    """
 
     def __init__(self):
         self.current_speed_limit: int = 0
         self.sign_detected: bool = False
         self.violated_ids: set = set()
-        self.cooldown_dict: dict = {}
-        self.speed_map: dict = {}
+        self.cooldown_dict: dict = {}       # track_id → last_violation_frame
+        self.speed_map: dict = {}           # track_id → speed (km/h) để annotate
         self._estimator: Optional[FisheyeSpeedEstimator] = None
         self._prev_ids: set = set()
 
+    # ── Sign parsing ─────────────────────────────────────────
     def _parse_speed_limit(self, sign_results, sign_model) -> Optional[int]:
+        """
+        Lấy giới hạn tốc độ cao nhất confidence từ kết quả model biển báo.
+        Class name dạng "50", "speed_60", "limit_30" → lấy số hợp lệ.
+        """
         if sign_results is None or sign_model is None:
             return None
         best_conf, best_limit = 0.0, None
@@ -1400,6 +856,7 @@ class SpeedLimitChecker:
                 if int(n) in _VALID_SPEED_LIMITS:
                     limit_val = int(n)
                     break
+            # Thử cls_id trực tiếp nếu class name không chứa số hợp lệ
             if limit_val is None:
                 cls_id_val = int(box.cls[0])
                 if cls_id_val in _VALID_SPEED_LIMITS:
@@ -1408,6 +865,7 @@ class SpeedLimitChecker:
                 best_conf, best_limit = conf, limit_val
         return best_limit
 
+    # ── Main check ───────────────────────────────────────────
     def check(
         self,
         speed_sign_results,
@@ -1423,15 +881,18 @@ class SpeedLimitChecker:
     ) -> list[ViolationEvent]:
         violations = []
 
+        # Khởi tạo estimator khi biết kích thước frame
         if self._estimator is None:
             h, w = original_frame.shape[:2]
             self._estimator = FisheyeSpeedEstimator(w, h, fps=float(source_fps))
 
+        # Cập nhật giới hạn tốc độ từ biển báo
         new_limit = self._parse_speed_limit(speed_sign_results, speed_sign_model)
         if new_limit:
             self.current_speed_limit = new_limit
             self.sign_detected = True
 
+        # Chưa thấy biển nào → không xử lý
         if not self.sign_detected or self.current_speed_limit <= 0:
             return violations
 
@@ -1452,9 +913,11 @@ class SpeedLimitChecker:
             bbox = (x1, y1, x2, y2)
             speed = self._estimator.estimate_speed(track_id, bbox, frame_number)
 
+            # Lưu để annotate (kể cả speed == 0)
             if speed >= 0:
                 self.speed_map[track_id] = speed
 
+            # Kiểm tra vi phạm
             if speed >= _MIN_SPEED_TO_CHECK and speed > limit * _VIOLATION_THRESHOLD:
                 last_vio_frame = self.cooldown_dict.get(track_id, -_COOLDOWN_FRAMES - 1)
                 if frame_number - last_vio_frame >= _COOLDOWN_FRAMES:
@@ -1474,6 +937,7 @@ class SpeedLimitChecker:
                         evidence_path=evidence_path,
                     ))
 
+        # Dọn track đã biến mất
         for gone in self._prev_ids - cur_ids:
             self._estimator.remove_track(gone)
         self._prev_ids = cur_ids
@@ -1488,6 +952,7 @@ class SpeedLimitChecker:
         cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
         crop = frame[cy1:cy2, cx1:cx2].copy()
 
+        # Ghi thông tin lên ảnh bằng chứng
         cv2.putText(crop, f"ID:{track_id} {speed}km/h",
                     (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
         cv2.putText(crop, f"Limit:{self.current_speed_limit}km/h",
@@ -1515,11 +980,13 @@ class SpeedLimitChecker:
             self._estimator.reset()
 
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  UTILITIES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _poly_centroid(pts):
+    """Tính tâm (centroid) của polygon."""
     arr = np.array(pts, dtype=np.float32)
     return int(arr[:, 0].mean()), int(arr[:, 1].mean())
 
@@ -1533,21 +1000,31 @@ def _draw_lane_zone(
     alpha: float = 0.18,
     border_color=None,
 ):
+    """
+    Vẽ một polygon làn đường đẹp:
+      - fill mờ trong suốt
+      - viền dày rõ nét (LINE_AA)
+      - label + mũi tên Unicode ở tâm polygon, có nền đen shadow
+    """
     poly = np.array(pts, np.int32).reshape((-1, 1, 2))
     bcolor = border_color if border_color else fill_color
 
+    # Fill mờ
     overlay = frame.copy()
     cv2.fillPoly(overlay, [poly], fill_color)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
+    # Viền rõ nét
     cv2.polylines(frame, [poly], isClosed=True, color=bcolor, thickness=2, lineType=cv2.LINE_AA)
 
+    # Label ở tâm
     cx, cy = _poly_centroid(pts)
     text = f"{arrow} {label}" if arrow else label
     font = cv2.FONT_HERSHEY_DUPLEX
     scale, thick = 0.52, 1
 
     (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    # Nền đen phía sau chữ
     cv2.rectangle(
         frame,
         (cx - tw // 2 - 3, cy - th - 3),
@@ -1559,6 +1036,7 @@ def _draw_lane_zone(
 
 
 def _draw_zone_overlay(frame, polygon, color, label, alpha=0.25):
+    """Legacy helper — dùng bởi RedLightChecker."""
     overlay = frame.copy()
     cv2.fillPoly(overlay, [polygon], color)
     frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
