@@ -41,8 +41,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--source",           required=True,                            help="Duong dan video dau vao")
-    parser.add_argument("--light-weights",    default="models/Den1.pt",          help="Model nhan dien den giao thong")
-    parser.add_argument("--vehicle-weights",  default="models/Xe.pt",                   help="Model tracking xe")
+    parser.add_argument("--light-weights",    default="models/yolov11_traffic_light.pt",          help="Model nhan dien den giao thong")
+    parser.add_argument("--vehicle-weights",  default="models/yolov11_vehicle.pt",                   help="Model tracking xe")
     parser.add_argument("--output",           default="outputs/results/output.mp4",     help="Duong dan video ket qua")
     parser.add_argument("--evidence-dir",     default="outputs/violations",             help="Thu muc luu bang chung vi pham")
     parser.add_argument("--log-file",         default="outputs/violations/log.json",    help="File JSON luu log vi pham")
