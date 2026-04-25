@@ -255,12 +255,18 @@ class DetectionPipeline:
             all_violations.extend(lane_violations)
 
         # --- Speed check ---
-        if results.get("speed") is not None and speed_model and len(v_boxes) > 0:
+        if results.get("speed") is not None and speed_model:
+            if self.source_type == "webcam":
+                current_timestamp = time.time()
+            else:
+                current_timestamp = self.frame_count / self.source_fps if self.source_fps > 0 else 0.0
+                
             speed_violations = self.speed_limit_checker.check(
                 results["speed"], v_boxes, v_ids, v_classes, v_confs,
                 vehicle_model, self.frame_count, original_frame,
                 source_fps=self.source_fps,
                 speed_sign_model=speed_model,
+                current_timestamp=current_timestamp,
             )
             all_violations.extend(speed_violations)
 
@@ -412,11 +418,18 @@ class DetectionPipeline:
         # 4b. Vẽ biển báo tốc độ
         if results.get("speed") is not None and speed_model:
             SPEED_SIGN_COLOR = (0, 200, 255)   # Cam-cyan
+            current_limit = self.speed_limit_checker.current_speed_limit
+            
             for box in results["speed"].boxes:
                 cls_id = int(box.cls[0])
                 conf_s = float(box.conf[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cls_name = speed_model.names[cls_id]  # VD: "50", "60"...
+
+                # Chỉ vẽ những biển báo khớp với giới hạn tốc độ đã chốt (tránh lỗi double detection)
+                if current_limit > 0 and str(current_limit) not in cls_name:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
 
                 # Vẽ khung và label
                 cv2.rectangle(frame, (x1, y1), (x2, y2), SPEED_SIGN_COLOR, 2)

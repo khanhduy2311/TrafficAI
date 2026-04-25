@@ -28,16 +28,16 @@ CONF_THRESHOLD   = 0.25
 SIGN_DETECT_CONF = 0.10
 
 # Perspective speed estimator
-CAMERA_HEIGHT_M      = 6.0
-FOCAL_LENGTH_PX      = 400.0
-GLOBAL_SPEED_SCALE   = 0.8
+CAMERA_HEIGHT_M      = 9.0
+FOCAL_LENGTH_PX      = 500.0
+GLOBAL_SPEED_SCALE   = 1.4
 
 SPEED_MEDIAN_WINDOW        = 15
-SPEED_STABLE_FRAMES        = 7
-SPEED_STABLE_TOLERANCE_KMH = 4.0
+SPEED_STABLE_FRAMES        = 3
+SPEED_STABLE_TOLERANCE_KMH = 8.0
 MAX_PHYSICAL_KMH           = 120.0
 MAX_FRAME_GAP              = 4
-UNLOCK_DELTA_KMH           = 6.0
+UNLOCK_DELTA_KMH           = 8.0
 WARMUP_FRAMES              = 10
 
 DEFAULT_SPEED_LIMIT  = 50
@@ -73,11 +73,23 @@ class ViolationEvent:
 #Perspective Projection (Pinhole Camera Model) & Violation Detection with Cooldown
 class PerspectiveSpeedEstimator:
 
-    def __init__(self, frame_w: int, frame_h: int, fps: float):
+    def __init__(self, frame_w: int, frame_h: int, fps: float, video_name: str = "unknown"):
         self.fps     = fps
         self.frame_w = frame_w
         self.frame_h = frame_h
         self._tracks: dict = {}
+        
+        # Cấu hình vùng tham chiếu ảo
+        self.y_start = int(frame_h * 0.35)
+        self.y_end   = int(frame_h * 0.65)
+        self.s_zone  = 25.0
+        self.video_name = video_name
+        self.eval_csv = "output/evaluation_log.csv"
+        
+        os.makedirs(os.path.dirname(self.eval_csv) or ".", exist_ok=True)
+        if not os.path.exists(self.eval_csv):
+            with open(self.eval_csv, "w", encoding="utf-8") as f:
+                f.write("video_name,track_id,v_raw,v_ema,v_locked,v_zone,entry_frame,exit_frame\n")
 
     def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int) -> int:
         """Trả về tốc độ km/h >= 0. Trả -1 nếu bbox quá nhỏ (không tin cậy)."""
@@ -97,6 +109,9 @@ class PerspectiveSpeedEstimator:
                 "locked_speed": None,
                 "ema_speed":    0.0,
                 "zone_frames":  0,
+                "entry_frame":  None,
+                "exit_frame":   None,
+                "v_zone_logged": False
             }
 
         track = self._tracks[track_id]
@@ -143,6 +158,28 @@ class PerspectiveSpeedEstimator:
                 smoothed = track["ema_speed"]
                 self._update_lock(track, smoothed)
 
+                # --- Vùng tham chiếu ảo logic ---
+                if not track["v_zone_logged"]:
+                    if track["entry_frame"] is None and cy_px >= self.y_start and cy_px < self.y_end:
+                        track["entry_frame"] = frame_idx
+                    
+                    if track["entry_frame"] is not None and track["exit_frame"] is None and cy_px >= self.y_end:
+                        track["exit_frame"] = frame_idx
+                        frames_passed = track["exit_frame"] - track["entry_frame"]
+                        
+                        # Chỉ tính V_zone nếu xe tốn ít nhất 5 frames để đi qua (chống chia cho số quá nhỏ gây nhiễu)
+                        if frames_passed >= 5:
+                            time_passed = frames_passed / self.fps
+                            v_zone = (self.s_zone / time_passed) * 3.6
+                            v_raw = inst_kmh
+                            v_ema = smoothed
+                            v_locked = track["locked_speed"] if track["locked_speed"] is not None else 0.0
+                            
+                            with open(self.eval_csv, "a", encoding="utf-8") as f:
+                                f.write(f"{self.video_name},{track_id},{v_raw:.2f},{v_ema:.2f},{v_locked:.2f},{v_zone:.2f},{track['entry_frame']},{track['exit_frame']}\n")
+                        track["v_zone_logged"] = True
+                # --------------------------------
+
                 if track["locked_speed"] is not None:
                     return int(round(track["locked_speed"]))
                 return int(round(smoothed))
@@ -156,7 +193,7 @@ class PerspectiveSpeedEstimator:
     def _reset_track(self, track, cx, cy, bh, frame_idx):
         track["history"].clear()
         track["speeds"].clear()
-        track.update({"stable_count": 0, "locked_speed": None, "ema_speed": 0.0, "zone_frames": 1})
+        track.update({"stable_count": 0, "locked_speed": None, "ema_speed": 0.0, "zone_frames": 1, "entry_frame": None, "exit_frame": None, "v_zone_logged": False})
         track["history"].append((cx, cy, bh, frame_idx))
 
     def _update_lock(self, track, smoothed: float):
@@ -357,16 +394,13 @@ def _detect_speed_limit(cap: cv2.VideoCapture, sign_model: YOLO) -> int:
 
 
 #MAIN
-def run(
+def process_video(
     source: str,
+    v_model: YOLO,
+    s_model: YOLO,
     output_dir: str = "output",
-    vehicle_model: str = DEFAULT_VEHICLE_MODEL,
-    sign_model: str = DEFAULT_SIGN_MODEL,
     speed_limit: Optional[int] = None,
 ) -> str:
-    v_model = YOLO(vehicle_model)
-    s_model = YOLO(sign_model)
-
     cap     = cv2.VideoCapture(source)
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -379,7 +413,8 @@ def run(
     else:
         current_limit = _detect_speed_limit(cap, s_model)
 
-    estimator = PerspectiveSpeedEstimator(frame_w, frame_h, fps=fps)
+    video_name = os.path.basename(source)
+    estimator = PerspectiveSpeedEstimator(frame_w, frame_h, fps=fps, video_name=video_name)
     detector  = ViolationDetector()
     annotator = Annotator(frame_w, frame_h)
 
@@ -463,9 +498,34 @@ def run(
     return out_video
 
 
+def run(
+    source_dir: str,
+    output_dir: str = "output",
+    vehicle_model: str = DEFAULT_VEHICLE_MODEL,
+    sign_model: str = DEFAULT_SIGN_MODEL,
+    speed_limit: Optional[int] = None,
+):
+    v_model = YOLO(vehicle_model)
+    s_model = YOLO(sign_model)
+    
+    if os.path.isdir(source_dir):
+        videos = [os.path.join(source_dir, f) for f in os.listdir(source_dir) if f.endswith(('.mp4', '.avi'))]
+    else:
+        videos = [source_dir]
+        
+    # Xóa log cũ trước khi chạy batch mới để tránh dính dữ liệu cũ
+    eval_csv = "output/evaluation_log.csv"
+    if os.path.exists(eval_csv):
+        os.remove(eval_csv)
+        
+    print(f"[*] Found {len(videos)} videos to process in {source_dir}")
+    for vid in videos:
+        print(f"\n{'='*50}\n[*] Processing {vid}\n{'='*50}")
+        process_video(vid, v_model, s_model, output_dir, speed_limit)
 
-run(
-    source="PATH/TO/VIDEO.mp4",
-    vehicle_model="PATH/TO/VEHICLE_MODEL.pt",
-    sign_model="PATH/TO/SIGN_MODEL.pt",
-)
+if __name__ == "__main__":
+    run(
+        source_dir="data/test_videos",
+        vehicle_model="model/tracking.pt",
+        sign_model="model/detect_speed_sign.pt",
+    )

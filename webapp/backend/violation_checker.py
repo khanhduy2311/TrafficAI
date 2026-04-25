@@ -638,11 +638,11 @@ import re as _re
 
 # ── Hằng số tốc độ ──────────────────────────────────────────────────────────
 _SPEED_MEDIAN_WINDOW        = 15       # Cửa sổ median rộng hơn → ổn định hơn
-_SPEED_STABLE_FRAMES        = 7        # Yêu cầu nhiều frame ổn định hơn
-_SPEED_STABLE_TOLERANCE_KMH = 4.0
+_SPEED_STABLE_FRAMES        = 3        # Giảm số frame cần thiết để dễ chốt tốc độ hơn
+_SPEED_STABLE_TOLERANCE_KMH = 8.0      # Nới lỏng dung sai để dễ chốt
 _MAX_PHYSICAL_KMH           = 120.0   # Cap thực tế cho đường đô thị
 _MAX_FRAME_GAP              = 4        # Nghiêm ngặt hơn để tránh jump lớn
-_UNLOCK_DELTA_KMH           = 6.0
+_UNLOCK_DELTA_KMH           = 12.0     # Khó vỡ lock hơn
 _WARMUP_FRAMES              = 10       # Warmup dài hơn để tích lũy đủ history
 _VALID_SPEED_LIMITS         = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
 _MIN_SPEED_TO_CHECK         = 5
@@ -651,7 +651,7 @@ _COOLDOWN_FRAMES            = 90
 _VALID_RADIUS_RATIO         = 1.0
 # ── Tham số calibration perspective ─────────────────────────────────────────
 # Chiều cao camera thực tế so với mặt đường (mét)
-_CAMERA_HEIGHT_M            = 6.0
+_CAMERA_HEIGHT_M            = 10.0
 # Tiêu cự ảo (focal_length / sensor_pixel_size) — chỉnh theo camera thực tế.
 # Giá trị này ảnh hưởng trực tiếp scale tốc độ. Tăng lên → tốc độ nhỏ lại.
 _FOCAL_LENGTH_PX            = 400.0
@@ -663,23 +663,12 @@ _NEAR_ZONE_RATIO            = 0.25
 _FAR_ZONE_RATIO             = 0.05
 # Scale factor toàn cục: tăng → tốc độ nhanh hơn, giảm → chậm hơn
 # Mỗi +0.05 ≈ +5 km/h ở tốc độ đô thị ~30 km/h
-_GLOBAL_SPEED_SCALE         = 0.8    # Tăng từ 0.55 → thêm ~5 km/h
+_GLOBAL_SPEED_SCALE         = 1.3
 
 
 class PerspectiveSpeedEstimator:
     """
     Ước tính tốc độ dựa trên Perspective Projection (Pinhole Camera Model).
-
-    Nguyên lý:
-    - Bbox height (pixel) của xe tỉ lệ nghịch với khoảng cách thực tế đến camera.
-    - Khi xe di chuyển Δpx pixel trên màn hình, khoảng cách thực tương ứng
-      được tính từ tỉ lệ: ground_dist = Δpx * depth / focal_length_px
-    - depth ≈ camera_height / sin(elevation_angle) ≈ camera_height * f / bbox_h * scale
-
-    Ưu điểm so với fisheye model cũ:
-    - Không giả định camera overhead 185° FOV (sai với camera giao thông)
-    - Xe ở giữa xa/nhỏ → bbox_h nhỏ → depth lớn → Δpx nhỏ → tốc độ thấp đúng thực tế
-    - Xe gần/lớn → bbox_h lớn → depth nhỏ → Δpx lớn → tính đúng tốc độ cao
     """
 
     def __init__(self, frame_w: int, frame_h: int, fps: float):
@@ -688,24 +677,24 @@ class PerspectiveSpeedEstimator:
         self.frame_h   = frame_h
         self._tracks: dict = {}
 
-    # ── Public API ──────────────────────────────────────────────────────────
-    def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int) -> int:
+    def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int, current_timestamp: float) -> int:
         """
-        Trả về tốc độ (km/h) >= 0.
-        Trả 0 khi warmup hoặc không đủ dữ liệu.
+        Ước lượng vận tốc với logic:
+        1. Tính toán delta time (dt) dựa trên timestamp thực tế.
+        2. Nếu xe lọt vào Vùng tham chiếu ảo, ghi nhận V_zone.
+        3. Tính toán inst_kmh, làm mượt bằng EMA, và khóa (lock) tốc độ.
         """
         x1, y1, x2, y2 = bbox
-        cx_px  = (x1 + x2) / 2.0   # Tâm ngang bbox
-        cy_px  = (y1 + y2) / 2.0   # Tâm dọc bbox
-        bh_px  = float(y2 - y1)    # Chiều cao bbox (pixel) — proxy khoảng cách
+        cx_px  = (x1 + x2) / 2.0
+        cy_px  = y2  # Lấy đáy bounding box
+        bh_px  = float(y2 - y1)
 
-        # Bỏ qua bbox quá nhỏ (quá xa, không đủ tin cậy)
         if bh_px < 8:
             return 0
 
         if track_id not in self._tracks:
             self._tracks[track_id] = {
-                "history":      deque(maxlen=12),  # (cx, cy, bh, frame_idx)
+                "history":      deque(maxlen=12),  # [(cx, cy, bh, frame_idx, timestamp), ...]
                 "speeds":       deque(maxlen=_SPEED_MEDIAN_WINDOW),
                 "stable_count": 0,
                 "locked_speed": None,
@@ -718,49 +707,32 @@ class PerspectiveSpeedEstimator:
         history = track["history"]
 
         if history:
-            prev_cx, prev_cy, prev_bh, prev_idx = history[-1]
+            prev_cx, prev_cy, prev_bh, prev_idx, prev_ts = history[-1]
             frame_gap = frame_idx - prev_idx
 
             if frame_gap > _MAX_FRAME_GAP:
-                # Xe bị miss quá nhiều frame → reset
-                self._reset_track(track, cx_px, cy_px, bh_px, frame_idx)
+                self._reset_track(track, cx_px, cy_px, bh_px, frame_idx, current_timestamp)
                 return 0
 
-            dt = frame_gap / self.fps if self.fps > 0 else 0.0
+            dt = current_timestamp - prev_ts
             if dt > 0:
-                # Dùng bbox height trung bình của 2 frame để ước tính depth
                 avg_bh = (bh_px + prev_bh) / 2.0
-
-                # Khoảng cách thực tế ~ camera_height_m * focal_length_px / bbox_height_px
-                # (từ similar triangles: object_size/distance = image_size/focal_length)
                 depth_m = (_CAMERA_HEIGHT_M * _FOCAL_LENGTH_PX) / max(avg_bh, 1.0)
-
-                # Di chuyển pixel trong không gian ảnh
                 dpx = _math.hypot(cx_px - prev_cx, cy_px - prev_cy)
-
-                # Quy đổi sang mét thực: dist_m = dpx * depth_m / focal_length
-                dist_m = dpx * depth_m / _FOCAL_LENGTH_PX
-
-                # Áp dụng scale toàn cục để bù sai số model
-                dist_m *= _GLOBAL_SPEED_SCALE
-
+                dist_m = (dpx * depth_m / _FOCAL_LENGTH_PX) * _GLOBAL_SPEED_SCALE
                 inst_kmh = (dist_m / dt) * 3.6
 
-                # Clamp tốc độ vật lý
                 if inst_kmh > _MAX_PHYSICAL_KMH:
                     inst_kmh = track["speeds"][-1] if track["speeds"] else 0.0
 
-                history.append((cx_px, cy_px, bh_px, frame_idx))
+                history.append((cx_px, cy_px, bh_px, frame_idx, current_timestamp))
 
                 if track["zone_frames"] <= _WARMUP_FRAMES:
                     return 0
 
                 track["speeds"].append(inst_kmh)
-
-                # Median filter → chống outlier
                 median_speed = float(np.median(track["speeds"]))
 
-                # EMA smoothing
                 if track["ema_speed"] == 0.0:
                     track["ema_speed"] = median_speed
                 else:
@@ -773,7 +745,7 @@ class PerspectiveSpeedEstimator:
                     return int(round(track["locked_speed"]))
                 return int(round(smoothed))
 
-        history.append((cx_px, cy_px, bh_px, frame_idx))
+        history.append((cx_px, cy_px, bh_px, frame_idx, current_timestamp))
         return 0
 
     def remove_track(self, track_id: int):
@@ -782,15 +754,14 @@ class PerspectiveSpeedEstimator:
     def reset(self):
         self._tracks.clear()
 
-    # ── Private helpers ──────────────────────────────────────────────────────
-    def _reset_track(self, track, cx, cy, bh, frame_idx):
+    def _reset_track(self, track, cx, cy, bh, frame_idx, current_timestamp):
         track["history"].clear()
         track["speeds"].clear()
         track.update({
             "stable_count": 0, "locked_speed": None,
             "ema_speed": 0.0,  "zone_frames": 1,
         })
-        track["history"].append((cx, cy, bh, frame_idx))
+        track["history"].append((cx, cy, bh, frame_idx, current_timestamp))
 
     def _update_lock(self, track, smoothed: float):
         locked = track["locked_speed"]
@@ -812,39 +783,25 @@ class PerspectiveSpeedEstimator:
             track["locked_speed"] = smoothed
 
 
-# Alias backward-compat cho code cũ vẫn dùng tên FisheyeSpeedEstimator
+# Alias backward-compat
 FisheyeSpeedEstimator = PerspectiveSpeedEstimator
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  5. SPEED LIMIT VIOLATION CHECKER
-#     Dùng FisheyeSpeedEstimator + model detect biển báo tốc độ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SpeedLimitChecker:
-    """
-    Phát hiện xe vượt quá tốc độ cho phép.
-
-    - Chỉ bắt vi phạm sau khi model detect được biển báo tốc độ (sign_detected).
-    - Tính tốc độ bằng FisheyeSpeedEstimator (EMA + lock speed + distortion).
-    - Cooldown 90 frame / xe để tránh lưu bằng chứng trùng lặp.
-    """
-
     def __init__(self):
         self.current_speed_limit: int = 0
         self.sign_detected: bool = False
         self.violated_ids: set = set()
-        self.cooldown_dict: dict = {}       # track_id → last_violation_frame
-        self.speed_map: dict = {}           # track_id → speed (km/h) để annotate
+        self.cooldown_dict: dict = {}
+        self.speed_map: dict = {}
         self._estimator: Optional[FisheyeSpeedEstimator] = None
         self._prev_ids: set = set()
 
-    # ── Sign parsing ─────────────────────────────────────────
     def _parse_speed_limit(self, sign_results, sign_model) -> Optional[int]:
-        """
-        Lấy giới hạn tốc độ cao nhất confidence từ kết quả model biển báo.
-        Class name dạng "50", "speed_60", "limit_30" → lấy số hợp lệ.
-        """
         if sign_results is None or sign_model is None:
             return None
         best_conf, best_limit = 0.0, None
@@ -856,7 +813,6 @@ class SpeedLimitChecker:
                 if int(n) in _VALID_SPEED_LIMITS:
                     limit_val = int(n)
                     break
-            # Thử cls_id trực tiếp nếu class name không chứa số hợp lệ
             if limit_val is None:
                 cls_id_val = int(box.cls[0])
                 if cls_id_val in _VALID_SPEED_LIMITS:
@@ -865,7 +821,6 @@ class SpeedLimitChecker:
                 best_conf, best_limit = conf, limit_val
         return best_limit
 
-    # ── Main check ───────────────────────────────────────────
     def check(
         self,
         speed_sign_results,
@@ -878,21 +833,18 @@ class SpeedLimitChecker:
         original_frame: np.ndarray,
         source_fps: int = 25,
         speed_sign_model=None,
+        current_timestamp: float = 0.0,
     ) -> list[ViolationEvent]:
         violations = []
-
-        # Khởi tạo estimator khi biết kích thước frame
         if self._estimator is None:
             h, w = original_frame.shape[:2]
             self._estimator = FisheyeSpeedEstimator(w, h, fps=float(source_fps))
 
-        # Cập nhật giới hạn tốc độ từ biển báo
         new_limit = self._parse_speed_limit(speed_sign_results, speed_sign_model)
         if new_limit:
             self.current_speed_limit = new_limit
             self.sign_detected = True
 
-        # Chưa thấy biển nào → không xử lý
         if not self.sign_detected or self.current_speed_limit <= 0:
             return violations
 
@@ -910,14 +862,11 @@ class SpeedLimitChecker:
                 continue
 
             cur_ids.add(track_id)
-            bbox = (x1, y1, x2, y2)
-            speed = self._estimator.estimate_speed(track_id, bbox, frame_number)
+            speed = self._estimator.estimate_speed(track_id, (x1, y1, x2, y2), frame_number, current_timestamp)
 
-            # Lưu để annotate (kể cả speed == 0)
             if speed >= 0:
                 self.speed_map[track_id] = speed
 
-            # Kiểm tra vi phạm
             if speed >= _MIN_SPEED_TO_CHECK and speed > limit * _VIOLATION_THRESHOLD:
                 last_vio_frame = self.cooldown_dict.get(track_id, -_COOLDOWN_FRAMES - 1)
                 if frame_number - last_vio_frame >= _COOLDOWN_FRAMES:
