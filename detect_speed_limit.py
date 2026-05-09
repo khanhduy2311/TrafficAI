@@ -1,8 +1,7 @@
 """
-Traffic Speed Violation 
+Traffic Speed Violation Detection
 """
 
-import argparse
 import csv
 import math
 import os
@@ -19,7 +18,7 @@ import numpy as np
 from ultralytics import YOLO
 from ultralytics.utils.files import increment_path
 
-#CONFIG
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 DEFAULT_VEHICLE_MODEL = "models/vehicle.pt"
 DEFAULT_SIGN_MODEL    = "models/sign.pt"
 
@@ -27,10 +26,10 @@ IMG_SIZE         = 960
 CONF_THRESHOLD   = 0.25
 SIGN_DETECT_CONF = 0.10
 
-# Perspective speed estimator
-CAMERA_HEIGHT_M      = 9.0
-FOCAL_LENGTH_PX      = 500.0
-GLOBAL_SPEED_SCALE   = 1.4
+
+CAMERA_HEIGHT_M    = 9.0
+FOCAL_LENGTH_PX    = 500.0
+GLOBAL_SPEED_SCALE = 0.8 #Tùy chỉnh
 
 SPEED_MEDIAN_WINDOW        = 15
 SPEED_STABLE_FRAMES        = 3
@@ -45,6 +44,10 @@ VIOLATION_THRESHOLD  = 1.0
 MIN_SPEED_TO_CHECK   = 5
 COOLDOWN_FRAMES      = 90
 
+# Ngưỡng conf tối thiểu để chấp nhận cập nhật limit
+# Chỉ detection đủ rõ mới được ghi đè — tránh flip nhầm khi camera chuyển góc
+SIGN_MIN_CONF = 0.35
+
 TARGET_CLASSES = {0: "Bus", 1: "Bike", 2: "Car", 3: "Pedestrian", 4: "Truck"}
 CLASS_COLORS   = {
     "Bus": (255, 0, 0), "Bike": (0, 255, 255),
@@ -55,10 +58,10 @@ EVIDENCE_DIR       = "violations/"
 VIOLATION_CSV_PATH = "output/violation_report.csv"
 TRACKER_CONFIG     = "bytetrack.yaml"
 
-#Classes for speed sign
 VALID_SPEED_LIMITS = {20, 30, 40, 50, 60, 70, 80, 90, 100, 120}
 
-#Set up 
+
+# ── DATA ──────────────────────────────────────────────────────────────────────
 @dataclass
 class ViolationEvent:
     track_id:   int
@@ -70,78 +73,79 @@ class ViolationEvent:
     timestamp:  float = field(default_factory=time.time)
     image_path: Optional[str] = None
 
-#Perspective Projection (Pinhole Camera Model) & Violation Detection with Cooldown
+
+# ── SPEED ESTIMATOR ───────────────────────────────────────────────────────────
 class PerspectiveSpeedEstimator:
+    """Pinhole Camera Model: bbox height → depth → speed."""
 
     def __init__(self, frame_w: int, frame_h: int, fps: float, video_name: str = "unknown"):
-        self.fps     = fps
-        self.frame_w = frame_w
-        self.frame_h = frame_h
+        self.fps      = fps
+        self.frame_w  = frame_w
+        self.frame_h  = frame_h
         self._tracks: dict = {}
-        
-        # Cấu hình vùng tham chiếu ảo
-        self.y_start = int(frame_h * 0.35)
-        self.y_end   = int(frame_h * 0.65)
-        self.s_zone  = 25.0
+
+        self.y_start    = int(frame_h * 0.35)
+        self.y_end      = int(frame_h * 0.65)
+        self.s_zone     = 25.0
         self.video_name = video_name
-        self.eval_csv = "output/evaluation_log.csv"
-        
+        self.eval_csv   = "output/evaluation_log.csv"
+
         os.makedirs(os.path.dirname(self.eval_csv) or ".", exist_ok=True)
         if not os.path.exists(self.eval_csv):
             with open(self.eval_csv, "w", encoding="utf-8") as f:
                 f.write("video_name,track_id,v_raw,v_ema,v_locked,v_zone,entry_frame,exit_frame\n")
 
-    def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int) -> int:
-        """Trả về tốc độ km/h >= 0. Trả -1 nếu bbox quá nhỏ (không tin cậy)."""
+    def estimate_speed(self, track_id: int, bbox: tuple, frame_idx: int,
+                       current_timestamp: float = 0.0) -> int:
+        """Trả về tốc độ km/h >= 0. Trả 0 nếu chưa đủ dữ liệu hoặc bbox quá nhỏ."""
         x1, y1, x2, y2 = bbox
         cx_px = (x1 + x2) / 2.0
         cy_px = (y1 + y2) / 2.0
         bh_px = float(y2 - y1)
 
         if bh_px < 8:
-            return -1
+            return 0
+
+        if current_timestamp == 0.0:
+            current_timestamp = time.time()
 
         if track_id not in self._tracks:
             self._tracks[track_id] = {
-                "history":      deque(maxlen=12),   # (cx, cy, bh, frame_idx)
-                "speeds":       deque(maxlen=SPEED_MEDIAN_WINDOW),
-                "stable_count": 0,
-                "locked_speed": None,
-                "ema_speed":    0.0,
-                "zone_frames":  0,
-                "entry_frame":  None,
-                "exit_frame":   None,
-                "v_zone_logged": False
+                "history":       deque(maxlen=12),
+                "speeds":        deque(maxlen=SPEED_MEDIAN_WINDOW),
+                "stable_count":  0,
+                "locked_speed":  None,
+                "ema_speed":     0.0,
+                "zone_frames":   0,
+                "entry_frame":   None,
+                "exit_frame":    None,
+                "v_zone_logged": False,
             }
 
-        track = self._tracks[track_id]
-        track["zone_frames"] += 1
+        track   = self._tracks[track_id]
         history = track["history"]
+        track["zone_frames"] += 1
 
         if history:
-            prev_cx, prev_cy, prev_bh, prev_idx = history[-1]
+            prev_cx, prev_cy, prev_bh, prev_idx, prev_ts = history[-1]
             frame_gap = frame_idx - prev_idx
 
             if frame_gap > MAX_FRAME_GAP:
-                self._reset_track(track, cx_px, cy_px, bh_px, frame_idx)
+                self._reset_track(track, cx_px, cy_px, bh_px, frame_idx, current_timestamp)
                 return 0
 
-            dt = frame_gap / self.fps if self.fps > 0 else 0.0
+            dt = current_timestamp - prev_ts
             if dt > 0:
-                avg_bh = (bh_px + prev_bh) / 2.0
-
-                # Depth từ similar triangles: camera_h * focal / bbox_h
-                depth_m = (CAMERA_HEIGHT_M * FOCAL_LENGTH_PX) / max(avg_bh, 1.0)
-
-                # Chuyển di chuyển pixel → mét thực
-                dpx    = math.hypot(cx_px - prev_cx, cy_px - prev_cy)
-                dist_m = dpx * depth_m / FOCAL_LENGTH_PX * GLOBAL_SPEED_SCALE
-
+                avg_bh   = (bh_px + prev_bh) / 2.0
+                depth_m  = (CAMERA_HEIGHT_M * FOCAL_LENGTH_PX) / max(avg_bh, 1.0)
+                dpx      = math.hypot(cx_px - prev_cx, cy_px - prev_cy)
+                dist_m   = dpx * depth_m / FOCAL_LENGTH_PX * GLOBAL_SPEED_SCALE
                 inst_kmh = (dist_m / dt) * 3.6
+
                 if inst_kmh > MAX_PHYSICAL_KMH:
                     inst_kmh = track["speeds"][-1] if track["speeds"] else 0.0
 
-                history.append((cx_px, cy_px, bh_px, frame_idx))
+                history.append((cx_px, cy_px, bh_px, frame_idx, current_timestamp))
 
                 if track["zone_frames"] <= WARMUP_FRAMES:
                     return 0
@@ -149,7 +153,6 @@ class PerspectiveSpeedEstimator:
                 track["speeds"].append(inst_kmh)
                 median_speed = float(np.median(track["speeds"]))
 
-                # EMA smoothing
                 if track["ema_speed"] == 0.0:
                     track["ema_speed"] = median_speed
                 else:
@@ -158,46 +161,46 @@ class PerspectiveSpeedEstimator:
                 smoothed = track["ema_speed"]
                 self._update_lock(track, smoothed)
 
-                # --- Vùng tham chiếu ảo logic ---
+                # V_zone eval
                 if not track["v_zone_logged"]:
-                    if track["entry_frame"] is None and cy_px >= self.y_start and cy_px < self.y_end:
+                    if track["entry_frame"] is None and self.y_start <= cy_px < self.y_end:
                         track["entry_frame"] = frame_idx
-                    
-                    if track["entry_frame"] is not None and track["exit_frame"] is None and cy_px >= self.y_end:
+                    if track["entry_frame"] is not None and track["exit_frame"] is None \
+                            and cy_px >= self.y_end:
                         track["exit_frame"] = frame_idx
                         frames_passed = track["exit_frame"] - track["entry_frame"]
-                        
-                        # Chỉ tính V_zone nếu xe tốn ít nhất 5 frames để đi qua (chống chia cho số quá nhỏ gây nhiễu)
                         if frames_passed >= 5:
                             time_passed = frames_passed / self.fps
-                            v_zone = (self.s_zone / time_passed) * 3.6
-                            v_raw = inst_kmh
-                            v_ema = smoothed
+                            v_zone   = (self.s_zone / time_passed) * 3.6
                             v_locked = track["locked_speed"] if track["locked_speed"] is not None else 0.0
-                            
                             with open(self.eval_csv, "a", encoding="utf-8") as f:
-                                f.write(f"{self.video_name},{track_id},{v_raw:.2f},{v_ema:.2f},{v_locked:.2f},{v_zone:.2f},{track['entry_frame']},{track['exit_frame']}\n")
+                                f.write(
+                                    f"{self.video_name},{track_id},"
+                                    f"{inst_kmh:.2f},{smoothed:.2f},{v_locked:.2f},"
+                                    f"{v_zone:.2f},{track['entry_frame']},{track['exit_frame']}\n"
+                                )
                         track["v_zone_logged"] = True
-                # --------------------------------
 
                 if track["locked_speed"] is not None:
                     return int(round(track["locked_speed"]))
                 return int(round(smoothed))
 
-        history.append((cx_px, cy_px, bh_px, frame_idx))
+        history.append((cx_px, cy_px, bh_px, frame_idx, current_timestamp))
         return 0
 
     def remove_track(self, track_id: int):
         self._tracks.pop(track_id, None)
 
-    def _reset_track(self, track, cx, cy, bh, frame_idx):
+    def _reset_track(self, track, cx, cy, bh, frame_idx, current_timestamp):
         track["history"].clear()
         track["speeds"].clear()
-        track.update({"stable_count": 0, "locked_speed": None, "ema_speed": 0.0, "zone_frames": 1, "entry_frame": None, "exit_frame": None, "v_zone_logged": False})
-        track["history"].append((cx, cy, bh, frame_idx))
+        track.update({
+            "stable_count": 0, "locked_speed": None, "ema_speed": 0.0,
+            "zone_frames": 1, "entry_frame": None, "exit_frame": None, "v_zone_logged": False,
+        })
+        track["history"].append((cx, cy, bh, frame_idx, current_timestamp))
 
     def _update_lock(self, track, smoothed: float):
-        """Khóa tốc độ khi đã ổn định đủ frame liên tiếp."""
         locked = track["locked_speed"]
         if locked is not None:
             if abs(smoothed - locked) <= UNLOCK_DELTA_KMH:
@@ -217,27 +220,90 @@ class PerspectiveSpeedEstimator:
             track["locked_speed"] = smoothed
 
 
-class ViolationDetector:
+# ── SPEED LIMIT TRACKER ───────────────────────────────────────────────────────
+def _parse_sign_result(sign_result) -> tuple[Optional[int], float]:
     """
-    Phát hiện vi phạm tốc độ với cooldown per-track.
-    speed_map dùng để annotate tốc độ trên frame.
+    Parse kết quả YOLO một frame → (limit_value, conf_cao_nhất).
+    Trả (None, 0.0) nếu không có detection hợp lệ.
+    """
+    if sign_result is None or sign_result.boxes is None:
+        return None, 0.0
+
+    best_conf, best_limit = 0.0, None
+    boxes = sign_result.boxes
+
+    for i in range(len(boxes)):
+        conf     = float(boxes.conf[i])
+        cls_id   = int(boxes.cls[i])
+        cls_name = sign_result.names.get(cls_id, "")
+
+        # Parse số từ tên class, fallback sang cls_id
+        limit_val = None
+        for n in re.findall(r'\d+', cls_name):
+            if int(n) in VALID_SPEED_LIMITS:
+                limit_val = int(n)
+                break
+        if limit_val is None and cls_id in VALID_SPEED_LIMITS:
+            limit_val = cls_id
+
+        # Chỉ giữ lại nếu conf cao hơn best hiện tại
+        if limit_val and conf > best_conf:
+            best_conf  = conf
+            best_limit = limit_val
+
+    return best_limit, best_conf
+
+
+class SpeedLimitTracker:
+    """
+    Cập nhật giới hạn tốc độ real-time từ biển báo.
     """
 
+    def __init__(self, default_limit: int = DEFAULT_SPEED_LIMIT, fps: float = 25.0):
+        self.current_limit   = default_limit
+        self.sign_detected   = False
+        self._best_conf_seen = 0.0
+        # Detect ~2 lần/giây, tự động thích nghi theo fps thực tế của video
+        # 25fps → 12, 30fps → 15, 60fps → 30
+        self._sample_interval = max(1, int(fps / 2))
+
+    def update(self, sign_result, frame_idx: int, verbose: bool = False) -> int:
+        """
+        Gọi mỗi frame nhưng chỉ xử lý ~2 lần/giây (dựa theo fps).
+        Trả về limit hiện tại (có thể đã cập nhật).
+        """
+        if frame_idx % self._sample_interval != 0:
+            return self.current_limit
+
+        limit_val, conf = _parse_sign_result(sign_result)
+
+        if limit_val is None:
+            return self.current_limit
+
+        # Bỏ qua nếu conf quá thấp — không đủ tin cậy để ghi đè
+        if conf < SIGN_MIN_CONF:
+            return self.current_limit
+
+        if limit_val != self.current_limit:
+            if verbose:
+                print(f"[SpeedLimit] Cập nhật: {self.current_limit} → {limit_val} km/h "
+                      f"(conf={conf:.3f})")
+            self.current_limit = limit_val
+
+        self._best_conf_seen = max(self._best_conf_seen, conf)
+        self.sign_detected   = True
+        return self.current_limit
+
+
+# ── VIOLATION DETECTOR ────────────────────────────────────────────────────────
+class ViolationDetector:
     def __init__(self, cooldown_frames: int = COOLDOWN_FRAMES):
         self.cooldown_frames = cooldown_frames
-        self._last: dict = {}       # track_id → frame_idx lần vi phạm cuối
-        self.speed_map: dict = {}   # track_id → speed_kmh để annotate
+        self._last: dict     = {}
+        self.speed_map: dict = {}
 
-    def check(
-        self,
-        track_id: int,
-        class_name: str,
-        speed_kmh: int,
-        limit_kmh: int,
-        bbox: tuple,
-        frame_idx: int,
-    ) -> Optional[ViolationEvent]:
-        #Update speed map
+    def check(self, track_id: int, class_name: str, speed_kmh: int,
+              limit_kmh: int, bbox: tuple, frame_idx: int) -> Optional[ViolationEvent]:
         if speed_kmh >= 0:
             self.speed_map[track_id] = speed_kmh
 
@@ -250,25 +316,18 @@ class ViolationDetector:
         return ViolationEvent(track_id, class_name, speed_kmh, limit_kmh, bbox, frame_idx)
 
 
+# ── ANNOTATOR ─────────────────────────────────────────────────────────────────
 class Annotator:
     COLOR_VIOLATION = (0, 0, 255)
 
     def __init__(self, frame_w: int, frame_h: int):
-        # Không cần valid radius nữa vì dùng perspective estimator
         pass
 
     def draw_zones(self, frame: np.ndarray):
         pass
 
-    def draw_vehicle(
-        self,
-        frame: np.ndarray,
-        track_id: int,
-        class_name: str,
-        bbox: tuple,
-        speed_kmh: int,
-        is_violation: bool,
-    ):
+    def draw_vehicle(self, frame: np.ndarray, track_id: int, class_name: str,
+                     bbox: tuple, speed_kmh: int, is_violation: bool):
         x1, y1, x2, y2 = bbox
         color = self.COLOR_VIOLATION if is_violation else CLASS_COLORS.get(class_name, (255, 255, 255))
         thick = 3 if is_violation else 2
@@ -284,11 +343,12 @@ class Annotator:
             txt = f"!!! {speed_kmh} km/h !!!" if is_violation else f"{speed_kmh} km/h"
             cv2.putText(frame, txt, (x1, y2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 3)
 
-    def draw_hud(self, frame: np.ndarray, limit_kmh: int):
-        h, w = frame.shape[:2]
-        x, y = w - 150, 20
+    def draw_hud(self, frame: np.ndarray, limit_kmh: int, sign_detected: bool = False):
+        h, w  = frame.shape[:2]
+        x, y  = w - 150, 20
+        border_color = (0, 220, 100) if sign_detected else (180, 180, 180)
         cv2.rectangle(frame, (x - 5, y - 5), (x + 130, y + 55), (0, 0, 0), -1)
-        cv2.rectangle(frame, (x - 5, y - 5), (x + 130, y + 55), (255, 255, 255), 2)
+        cv2.rectangle(frame, (x - 5, y - 5), (x + 130, y + 55), border_color, 2)
         cv2.putText(frame, "SPEED LIMIT", (x, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
         cv2.putText(frame, f"{limit_kmh} km/h", (x, y + 48), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 220, 255), 3)
 
@@ -300,6 +360,7 @@ class Annotator:
         cv2.putText(frame, "VI PHAM TOC DO!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
 
 
+# ── EVIDENCE & LOGGING ────────────────────────────────────────────────────────
 class EvidenceSaver:
     def __init__(self, evidence_dir: str = EVIDENCE_DIR):
         self.evidence_dir = evidence_dir
@@ -314,8 +375,10 @@ class EvidenceSaver:
             max(0, x1 - pad):min(w - 1, x2 + pad),
         ].copy()
         ts = datetime.fromtimestamp(event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(crop, f"ID:{event.track_id} {event.class_name}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-        cv2.putText(crop, f"Speed:{event.speed_kmh} Limit:{event.limit_kmh}", (5, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        cv2.putText(crop, f"ID:{event.track_id} {event.class_name}",
+                    (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        cv2.putText(crop, f"Speed:{event.speed_kmh} Limit:{event.limit_kmh}",
+                    (5, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
         cv2.putText(crop, ts, (5, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
         fpath = os.path.join(self.evidence_dir, f"ID{event.track_id}_{event.speed_kmh}kmh.jpg")
         cv2.imwrite(fpath, crop)
@@ -346,54 +409,7 @@ class ReportLogger:
             csv.DictWriter(f, fieldnames=self.COLUMNS).writerow(row)
 
 
-#DETECT SPEED LIMIT FROM VIDEO
-def _detect_speed_limit(cap: cv2.VideoCapture, sign_model: YOLO) -> int:
-    """Quét các frame đầu để chốt giới hạn tốc độ từ biển báo."""
-    frames_to_check = [0, 5, 10, 15, 20, 25, 30]
-    best_conf, best_limit = 0.0, None
-
-    print(f"\n[SpeedLimit] Đang quét các frame đầu để chốt biển báo...")
-
-    for fno in frames_to_check:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        results = sign_model.predict(frame, imgsz=960, conf=SIGN_DETECT_CONF, verbose=False)
-        if not results or results[0].boxes is None:
-            continue
-
-        boxes = results[0].boxes
-        for i in range(len(boxes)):
-            conf     = float(boxes.conf[i])
-            cls_id   = int(boxes.cls[i])
-            cls_name = results[0].names.get(cls_id, "")
-
-            # Parse số hợp lệ từ class name, fallback sang cls_id
-            limit_val = None
-            for n in re.findall(r'\d+', cls_name):
-                if int(n) in VALID_SPEED_LIMITS:
-                    limit_val = int(n)
-                    break
-            if limit_val is None and cls_id in VALID_SPEED_LIMITS:
-                limit_val = cls_id
-
-            if limit_val and conf > best_conf:
-                best_conf  = conf
-                best_limit = limit_val
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    if best_limit:
-        print(f"[SpeedLimit] => Chốt: {best_limit} km/h (conf: {best_conf:.3f})\n")
-        return best_limit
-
-    print(f"[SpeedLimit] => Không tìm thấy biển → dùng default {DEFAULT_SPEED_LIMIT} km/h\n")
-    return DEFAULT_SPEED_LIMIT
-
-
-#MAIN
+# ── MAIN PROCESS ──────────────────────────────────────────────────────────────
 def process_video(
     source: str,
     v_model: YOLO,
@@ -407,13 +423,14 @@ def process_video(
     fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    video_name   = os.path.basename(source)
+    sign_tracker = SpeedLimitTracker(
+        default_limit=speed_limit if speed_limit is not None else DEFAULT_SPEED_LIMIT,
+        fps=fps,
+    )
     if speed_limit is not None:
-        current_limit = speed_limit
-        print(f"[SpeedLimit] User override: {current_limit} km/h")
-    else:
-        current_limit = _detect_speed_limit(cap, s_model)
+        print(f"[SpeedLimit] User override: {speed_limit} km/h")
 
-    video_name = os.path.basename(source)
     estimator = PerspectiveSpeedEstimator(frame_w, frame_h, fps=fps, video_name=video_name)
     detector  = ViolationDetector()
     annotator = Annotator(frame_w, frame_h)
@@ -427,9 +444,9 @@ def process_video(
     logger = ReportLogger(csv_path=str(run_dir / "violations.csv"))
     writer = cv2.VideoWriter(out_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_w, frame_h))
 
-    tracker_cfg = TRACKER_CONFIG if os.path.exists(TRACKER_CONFIG) else "bytetrack.yaml"
-
-    frame_idx, total_viol = 0, 0
+    tracker_cfg    = TRACKER_CONFIG if os.path.exists(TRACKER_CONFIG) else "bytetrack.yaml"
+    frame_idx      = 0
+    total_viol     = 0
     prev_track_ids = set()
 
     print(f"Bắt đầu tracking... {total} frames | Output: {out_video}")
@@ -439,9 +456,22 @@ def process_video(
             if not ret:
                 break
             frame_idx += 1
+            current_timestamp = time.time()
 
             if frame_idx % 50 == 0:
                 print(f"  Frame {frame_idx}/{total} ({frame_idx / total * 100:.1f}%) | Vi phạm: {total_viol}")
+
+            # Detect biển + cập nhật limit — sampling được xử lý bên trong tracker
+            if speed_limit is None:
+                sign_results = s_model.predict(frame, imgsz=IMG_SIZE, conf=SIGN_DETECT_CONF, verbose=False) \
+                    if frame_idx % sign_tracker._sample_interval == 0 else [None]
+                current_limit = sign_tracker.update(
+                    sign_results[0],
+                    frame_idx=frame_idx,
+                    verbose=True,
+                )
+            else:
+                current_limit = speed_limit
 
             annotator.draw_zones(frame)
             results = v_model.track(
@@ -460,14 +490,13 @@ def process_video(
                     cid = cls_ids[i]
                     if cid not in TARGET_CLASSES:
                         continue
-
                     cls_name = TARGET_CLASSES[cid]
                     if cls_name == "Pedestrian":
                         continue
 
                     cur_track_ids.add(tid)
                     bbox  = tuple(map(int, bboxes[i]))
-                    speed = estimator.estimate_speed(tid, bbox, frame_idx)
+                    speed = estimator.estimate_speed(tid, bbox, frame_idx, current_timestamp)
 
                     is_viol = False
                     if speed > 0:
@@ -486,7 +515,7 @@ def process_video(
 
             if has_viol:
                 annotator.draw_violation_flash(frame)
-            annotator.draw_hud(frame, current_limit)
+            annotator.draw_hud(frame, current_limit, sign_detected=sign_tracker.sign_detected)
             writer.write(frame)
 
     except KeyboardInterrupt:
@@ -507,21 +536,22 @@ def run(
 ):
     v_model = YOLO(vehicle_model)
     s_model = YOLO(sign_model)
-    
+
     if os.path.isdir(source_dir):
-        videos = [os.path.join(source_dir, f) for f in os.listdir(source_dir) if f.endswith(('.mp4', '.avi'))]
+        videos = [os.path.join(source_dir, f) for f in os.listdir(source_dir)
+                  if f.endswith(('.mp4', '.avi'))]
     else:
         videos = [source_dir]
-        
-    # Xóa log cũ trước khi chạy batch mới để tránh dính dữ liệu cũ
+
     eval_csv = "output/evaluation_log.csv"
     if os.path.exists(eval_csv):
         os.remove(eval_csv)
-        
+
     print(f"[*] Found {len(videos)} videos to process in {source_dir}")
     for vid in videos:
         print(f"\n{'='*50}\n[*] Processing {vid}\n{'='*50}")
         process_video(vid, v_model, s_model, output_dir, speed_limit)
+
 
 if __name__ == "__main__":
     run(

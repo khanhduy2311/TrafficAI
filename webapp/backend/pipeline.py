@@ -133,6 +133,11 @@ class DetectionPipeline:
         print(f"[Pipeline] Started — {self.frame_width}x{self.frame_height} "
               f"@{self.source_fps}fps, session={self.session_id}")
 
+        # Cảnh báo sớm khi model không load — tránh silent fallback
+        if not models_manager.get("speed_sign"):
+            print("[Pipeline] WARN: speed_sign model không load "
+                  "— SpeedLimitChecker sẽ dùng default_limit=50 km/h suốt phiên.")
+
     def stop(self):
         """Dừng pipeline."""
         self.is_running = False
@@ -191,9 +196,11 @@ class DetectionPipeline:
                 self._run_lane_detector, lane_model, original_frame
             )
 
-        # 1e. Speed sign detector (placeholder)
+        # 1e. Speed sign detector — chỉ submit khi model có sẵn
         speed_model = models_manager.get("speed_sign")
         if speed_model:
+            # Không guard sample_interval ở đây — SpeedLimitChecker.check()
+            # tự sample ~2 lần/giây bên trong. Guard ở 2 nơi gây double-check.
             futures["speed"] = self.executor.submit(
                 self._run_speed_detector, speed_model, original_frame
             )
@@ -255,20 +262,16 @@ class DetectionPipeline:
             all_violations.extend(lane_violations)
 
         # --- Speed check ---
-        if results.get("speed") is not None and speed_model:
-            if self.source_type == "webcam":
-                current_timestamp = time.time()
-            else:
-                current_timestamp = self.frame_count / self.source_fps if self.source_fps > 0 else 0.0
-                
-            speed_violations = self.speed_limit_checker.check(
-                results["speed"], v_boxes, v_ids, v_classes, v_confs,
-                vehicle_model, self.frame_count, original_frame,
-                source_fps=self.source_fps,
-                speed_sign_model=speed_model,
-                current_timestamp=current_timestamp,
-            )
-            all_violations.extend(speed_violations)
+        current_timestamp = time.time()
+        speed_violations = self.speed_limit_checker.check(
+            results.get("speed"),           # None nếu model không load → parse bỏ qua
+            v_boxes, v_ids, v_classes, v_confs,
+            vehicle_model, self.frame_count, original_frame,
+            source_fps=self.source_fps,
+            speed_sign_model=speed_model,   # None nếu không load
+            current_timestamp=current_timestamp,
+        )
+        all_violations.extend(speed_violations)
 
         # ═══════════════════════════════════════════════
         # BƯỚC 3: ANNOTATE FRAME
