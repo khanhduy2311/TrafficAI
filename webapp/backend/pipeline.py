@@ -242,9 +242,10 @@ class DetectionPipeline:
         if results.get("helmet") is not None and helmet_model:
             helmet_violations = self.no_helmet_checker.check(
                 results["helmet"], helmet_model,
-                self.frame_count, original_frame
+                self.frame_count, original_frame,
+                vehicle_results=results.get("vehicle"),  # thêm
+                vehicle_model=vehicle_model,              # thêm
             )
-            all_violations.extend(helmet_violations)
 
         # --- Lane check (placeholder) ---
         if results.get("lane") is not None and lane_model and len(v_boxes) > 0:

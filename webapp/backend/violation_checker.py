@@ -361,154 +361,242 @@ class RedLightChecker:
 class NoHelmetChecker:
     """
     Phát hiện người đi xe máy không đội mũ bảo hiểm.
-    Logic: Algorithm 4 - Temporal Confidence Window (TCW)
-    - Duy trì buffer confidence cho mỗi track_id
-    - Tính trung bình confidence trong N frame gần nhất
-    - Chỉ cảnh báo vi phạm khi trung bình > τ (threshold)
+    Pipeline 2 model:
+      Stage 1: vehicle_tracker detect + track Bike → lấy bbox + track_id
+      Stage 2: helmet model chạy full frame → map kết quả vào bbox xe máy
+               bằng point-in-box, ưu tiên no_helmet khi nhiều detection
+    Algorithm 4: Temporal Confidence Window (TCW)
     """
 
     def __init__(
-        self, 
+        self,
         window_size: int = 10,
         confidence_threshold: float = 0.5,
-        grace_period: int = 50
+        grace_period: int = 50,
+        helmet_conf: float = 0.3,
+        nms_dist: int = 30,
+        expand: float = 0.3,
     ):
-        # Algorithm 4 parameters
-        self.window_size = window_size          # N: số frame để tính trung bình
-        self.confidence_threshold = confidence_threshold  # τ: ngưỡng vi phạm
-        self.grace_period = grace_period        # Tránh ghi lại vi phạm liên tiếp
-        
-        # State management
-        # B_ID: bộ đếm lưu confidence score cho mỗi track_id
+        self.window_size = window_size
+        self.confidence_threshold = confidence_threshold
+        self.grace_period = grace_period
+        self.helmet_conf = helmet_conf
+        self.nms_dist = nms_dist
+        self.expand = expand
+
+        # State
         self.confidence_buffer: dict = defaultdict(lambda: deque(maxlen=window_size))
         self.last_violation_frame: dict = {}
         self.last_bbox: dict = {}
+        self.last_helmet_state: dict = {}
+        self.violated_ids: set = set()
+
+    # ──────────────────────────────────────────────
+    # PUBLIC
+    # ──────────────────────────────────────────────
 
     def check(
         self,
-        helmet_results,
+        helmet_results,       # kết quả từ helmet model (full frame)
         helmet_model,
         frame_number: int,
         original_frame: np.ndarray,
+        vehicle_results=None, # kết quả từ vehicle_tracker (có track_id)
+        vehicle_model=None,
     ) -> list[ViolationEvent]:
         """
-        Kiểm tra kết quả helmet detection theo Algorithm 4.
+        Kiểm tra vi phạm không đội mũ bảo hiểm theo Algorithm 4.
+        Yêu cầu vehicle_results để lấy bbox + track_id xe máy.
         """
         violations = []
-        boxes = helmet_results.boxes
-        current_ids = set()
 
-        if boxes is None:
+        # ── Lấy danh sách bbox xe máy từ vehicle_tracker ──
+        vehicle_boxes_list = []  # [(track_id, (x1,y1,x2,y2))]
+        if vehicle_results is not None and vehicle_model is not None:
+            vboxes = vehicle_results.boxes
+            if vboxes is not None and vboxes.id is not None:
+                bike_cls_ids = [
+                    cid for cid, name in vehicle_model.names.items()
+                    if name.lower() == "bike"
+                ]
+                for box in vboxes:
+                    cls_id = int(box.cls[0])
+                    if cls_id not in bike_cls_ids:
+                        continue
+                    track_id = int(box.id[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    vehicle_boxes_list.append((track_id, (x1, y1, x2, y2)))
+                    self.last_bbox[track_id] = (x1, y1, x2, y2)
+
+        if not vehicle_boxes_list:
             return violations
 
-        # ═══════════════════════════════════════════════════════════════
-        # BƯỚC 1: CẬP NHẬT BUFFER (Algorithm 4, dòng 2-9)
-        # ═══════════════════════════════════════════════════════════════
-        for box in boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            track_id = int(box.id[0]) if box.id is not None else -1
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        # ── Stage 2: Map helmet detection vào xe máy ──
+        track_helmet_map = self._classify_helmet_fullframe(
+            original_frame, helmet_results, helmet_model, vehicle_boxes_list
+        )
 
+        # ── Algorithm 4: Cập nhật buffer + kiểm tra vi phạm ──
+        current_ids = set()
+        for track_id, (x1, y1, x2, y2) in vehicle_boxes_list:
             current_ids.add(track_id)
-            self.last_bbox[track_id] = (x1, y1, x2, y2)
 
-            cls_name = helmet_model.names[cls_id].lower()
+            if track_id in track_helmet_map:
+                cls_name, conf = track_helmet_map[track_id]
+            else:
+                cls_name, conf = "unknown", 0.0
 
-            # Dòng 5-9: if c == no_helmet then B_ID.append(P_i) else B_ID.append(0)
-            if "no" in cls_name and "helmet" in cls_name:
+            self.last_helmet_state[track_id] = cls_name
+
+            # Dòng 5-8 Algorithm 4: cập nhật buffer
+            if cls_name == "no_helmet":
                 self.confidence_buffer[track_id].append(conf)
             else:
                 self.confidence_buffer[track_id].append(0.0)
 
-        # ═══════════════════════════════════════════════════════════════
-        # BƯỚC 2: KIỂM TRA VI PHẠM (Algorithm 4, dòng 10-16)
-        # ═══════════════════════════════════════════════════════════════
-        for box in boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            track_id = int(box.id[0]) if box.id is not None else -1
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            cls_name = helmet_model.names[cls_id].lower()
-            buffer = self.confidence_buffer[track_id]
-
-            # Dòng 10: if length(B_ID) >= N then
-            if len(buffer) >= self.window_size:
-                # Dòng 11: Tính điểm vi phạm trung bình S = (1/N) * Σ B_ID[j]
-                avg_confidence = sum(buffer) / len(buffer)
-
-                # Kiểm tra grace period
+            # Dòng 10-15 Algorithm 4: kiểm tra vi phạm
+            buf = self.confidence_buffer[track_id]
+            if len(buf) >= self.window_size:
+                avg_conf = sum(buf) / len(buf)
                 last_frame = self.last_violation_frame.get(track_id, -999999)
-                if frame_number - last_frame > self.grace_period:
-                    # Dòng 12-15: if S > τ then ... ghi nhận vi phạm
-                    if avg_confidence > self.confidence_threshold:
-                        self.last_violation_frame[track_id] = frame_number
 
-                        evidence_path = self._save_evidence(
-                            original_frame, x1, y1, x2, y2, 
-                            track_id, frame_number, avg_confidence
-                        )
+                if avg_conf > self.confidence_threshold and \
+                   frame_number - last_frame > self.grace_period:
 
-                        violations.append(ViolationEvent(
-                            track_id=track_id,
-                            vehicle_type="Bike",
-                            violation_type="no_helmet",
-                            confidence=avg_confidence,
-                            frame_number=frame_number,
-                            bbox=[x1, y1, x2, y2],
-                            evidence_path=evidence_path,
-                        ))
+                    self.last_violation_frame[track_id] = frame_number
+                    self.violated_ids.add(track_id)
 
-        # ═══════════════════════════════════════════════════════════════
-        # BƯỚC 3: CLEANUP & MEMORY MANAGEMENT
-        # ═══════════════════════════════════════════════════════════════
+                    evidence_path = self._save_evidence(
+                        original_frame, x1, y1, x2, y2,
+                        track_id, frame_number, avg_conf
+                    )
+                    violations.append(ViolationEvent(
+                        track_id=track_id,
+                        vehicle_type="Bike",
+                        violation_type="no_helmet",
+                        confidence=avg_conf,
+                        frame_number=frame_number,
+                        bbox=[x1, y1, x2, y2],
+                        evidence_path=evidence_path,
+                    ))
+
         self._cleanup_old_tracks(current_ids, frame_number)
-
         return violations
 
-    def _save_evidence(
-        self, 
-        frame, 
-        x1, y1, x2, y2, 
-        track_id, 
-        frame_number, 
-        avg_confidence
-    ) -> str:
-        """Crop và lưu ảnh bằng chứng."""
+    # ──────────────────────────────────────────────
+    # PRIVATE
+    # ──────────────────────────────────────────────
+
+    def _point_in_box(self, px, py, x1, y1, x2, y2) -> bool:
+        """Kiểm tra điểm có nằm trong bbox mở rộng không."""
+        w, h = x2 - x1, y2 - y1
+        ex1 = x1 - w * self.expand
+        ey1 = y1 - h * self.expand
+        ex2 = x2 + w * self.expand
+        ey2 = y2 + h * self.expand
+        return ex1 <= px <= ex2 and ey1 <= py <= ey2
+
+    def _classify_helmet_fullframe(
+        self,
+        frame: np.ndarray,
+        helmet_results,
+        helmet_model,
+        vehicle_boxes_list: list,
+    ) -> dict:
+        """
+        Chạy helmet model trên full frame, map kết quả vào xe máy
+        bằng point-in-box. Ưu tiên no_helmet khi nhiều detection.
+        Trả về: {track_id: (cls_name, conf)}
+        """
+        track_helmet_map = {}
+
+        if helmet_results is None or helmet_results.boxes is None:
+            return track_helmet_map
+
+        # Gom detections, bỏ qua class không phải helmet/no_helmet
+        detections = []
+        for hbox in helmet_results.boxes:
+            cls_id = int(hbox.cls[0])
+            cls_name = helmet_model.names[cls_id].lower().replace(" ", "_")
+            if cls_name not in ("helmet", "no_helmet"):
+                continue
+            hx1, hy1, hx2, hy2 = map(int, hbox.xyxy[0])
+            conf = float(hbox.conf[0])
+            if conf < self.helmet_conf:
+                continue
+            detections.append((conf, cls_name, hx1, hy1, hx2, hy2))
+
+        # Sắp xếp conf cao nhất trước
+        detections.sort(key=lambda x: -x[0])
+
+        # NMS đơn giản: loại detection quá gần nhau
+        kept = []
+        for det in detections:
+            conf, cls_name, hx1, hy1, hx2, hy2 = det
+            hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+            too_close = any(
+                ((hcx - (k[2]+k[4])/2)**2 + (hcy - (k[3]+k[5])/2)**2)**0.5 < self.nms_dist
+                for k in kept
+            )
+            if not too_close:
+                kept.append(det)
+
+        # Map vào xe máy bằng point-in-box
+        for conf, cls_name, hx1, hy1, hx2, hy2 in kept:
+            hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+
+            for tid, (vx1, vy1, vx2, vy2) in vehicle_boxes_list:
+                if not self._point_in_box(hcx, hcy, vx1, vy1, vx2, vy2):
+                    continue
+
+                existing = track_helmet_map.get(tid)
+                if existing is None:
+                    track_helmet_map[tid] = (cls_name, conf)
+                elif cls_name == "no_helmet":
+                    # no_helmet thắng helmet — ưu tiên Recall
+                    track_helmet_map[tid] = (cls_name, conf)
+                elif existing[0] != "no_helmet" and conf > existing[1]:
+                    track_helmet_map[tid] = (cls_name, conf)
+
+        return track_helmet_map
+
+    def _save_evidence(self, frame, x1, y1, x2, y2,
+                       track_id, frame_number, avg_conf) -> str:
         EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
         h, w = frame.shape[:2]
         pad = 20
-        
-        cx1 = max(0, x1 - pad)
-        cy1 = max(0, y1 - pad)
-        cx2 = min(w, x2 + pad)
-        cy2 = min(h, y2 + pad)
-        crop = frame[cy1:cy2, cx1:cx2]
+        cx1, cy1 = max(0, x1-pad), max(0, y1-pad)
+        cx2, cy2 = min(w, x2+pad), min(h, y2+pad)
+        crop = frame[cy1:cy2, cx1:cx2].copy()
+
+        cv2.putText(crop, f"ID:{track_id} S:{avg_conf:.2f} F:{frame_number}",
+                    (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"helmet_id{track_id}_f{frame_number}_s{avg_confidence:.2f}_{ts}.jpg"
+        filename = f"helmet_id{track_id}_f{frame_number}_s{avg_conf:.2f}_{ts}.jpg"
         path = EVIDENCE_DIR / filename
         cv2.imwrite(str(path), crop)
         return filename
 
     def _cleanup_old_tracks(self, current_ids: set, frame_number: int):
-        """Xóa state của track_id không còn xuất hiện."""
-        all_tracked_ids = set(self.confidence_buffer.keys()) | set(self.last_bbox.keys())
-        
-        for track_id in list(all_tracked_ids):
+        all_ids = set(self.confidence_buffer.keys()) | set(self.last_bbox.keys())
+        for track_id in list(all_ids):
             if track_id not in current_ids:
-                last_frame = self.last_violation_frame.get(track_id, -999999)
+                last_frame = self.last_violation_frame.get(
+                    track_id, frame_number - self.grace_period - 1
+                )
                 if frame_number - last_frame > self.grace_period:
                     self.confidence_buffer.pop(track_id, None)
                     self.last_bbox.pop(track_id, None)
                     self.last_violation_frame.pop(track_id, None)
+                    self.last_helmet_state.pop(track_id, None)
 
     def reset(self):
-        """Reset toàn bộ state."""
         self.confidence_buffer.clear()
         self.last_violation_frame.clear()
         self.last_bbox.clear()
+        self.last_helmet_state.clear()
+        self.violated_ids.clear()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

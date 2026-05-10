@@ -47,8 +47,8 @@ class ModelsManager:
             },
             "helmet": {
                 "path": MODEL_DIR / "detect_helmet.pt",
-                "description": "Phát hiện đội mũ / không đội mũ (Bike, helmet, no helmet)",
-                "classes": ["Bike", "helmet", "no helmet"],
+                "description": "Phát hiện đội mũ / không đội mũ",
+                "classes": ["helmet", "no_helmet"], 
             },
             "speed_sign": {
                 "path": MODEL_DIR / "detect_speed_sign.pt",
