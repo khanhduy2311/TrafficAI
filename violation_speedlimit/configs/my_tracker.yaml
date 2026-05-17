@@ -1,0 +1,13 @@
+tracker_type: bytetrack
+
+# 1. Ngưỡng phát hiện (Detection)
+track_high_thresh: 0.5   # Box rõ nét (>50%) mới được khởi tạo ID mới (Tránh rác)
+track_low_thresh: 0.1    # Box mờ tịt (10%) vẫn giữ lại để tracking (Quan trọng khi xe bị che/lóa)
+new_track_thresh: 0.6    # Yêu cầu độ tin cậy cao để xác nhận ID mới
+
+# 2. Bộ nhớ (Memory) - QUAN TRỌNG
+track_buffer: 120
+
+# 3. Độ khớp chuyển động (Matching)
+match_thresh: 0.7
+fuse_score: True

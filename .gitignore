@@ -1,0 +1,16 @@
+# Ignore python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Ignore datasets and weights
+datasets/
+*.pt
+*.pth
+runs/
+result_train_fisheye/
+
+# Ignore virtual environment
+venv/
+.venv/
+.env
