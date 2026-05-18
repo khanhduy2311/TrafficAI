@@ -2,15 +2,13 @@ import os
 from pathlib import Path
 from ultralytics import YOLO
 
-# 1. Tải mô hình RT-DETR Light
-model = YOLO("../rtdetr-l.pt")  # Nằm trong PlugIR_Workspace
 
-# 2. Định nghĩa thư mục lưu
+model = YOLO("../rtdetr-l.pt")  
+
 project_dir = "../result_train_fisheye"
 run_name = "run_rtdetr"
 os.makedirs(project_dir, exist_ok=True)
 
-# 3. Tiến hành Training
 model.train(
     data="/kaggle/input/datasets/nguynthnhthy/data-root/data_fisheye/dataset.yaml",
     epochs=100,
