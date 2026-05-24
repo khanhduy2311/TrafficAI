@@ -162,7 +162,7 @@ while cap.isOpened():
             continue
 
         # ===== LANE =====
-        if track_id not in lane_map:
+        if track_id not in direction_map:
             ratios = {
                 "left": box_in_poly_ratio(x1, y1, x2, y2, lane_left, h, w),
                 "straight": box_in_poly_ratio(x1, y1, x2, y2, lane_mid, h, w),
